@@ -73,7 +73,7 @@ def test_lambda_zero_equals_hard_projection():
 
 def test_target_modes_work():
     mu, measurement, mask_known = _fake_inputs()
-    for mode in ("projected_mu", "measurement_only_smooth", "mu"):
+    for mode in ("projected_mu", "measurement_only_smooth", "normalized_known_smooth", "mu"):
         result = structure_proximal_target(
             mu,
             measurement,

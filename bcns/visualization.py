@@ -1,7 +1,7 @@
 """Visualization helpers for BCNS Step 1 targets and smoke outputs."""
 
 from pathlib import Path
-from typing import List, Sequence, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import matplotlib
 
@@ -58,8 +58,14 @@ def save_mask_image(mask_known: torch.Tensor, path: PathLike) -> None:
     Image.fromarray(arr, mode="L").save(output)
 
 
-def save_heatmap(x: torch.Tensor, path: PathLike, normalize: bool = True) -> None:
-    """Save a scalar tensor heatmap."""
+def save_heatmap_uint8(
+    x: torch.Tensor,
+    path: PathLike,
+    normalize: bool = True,
+    cmap: str = "magma",
+    target_size: Optional[Tuple[int, int]] = None,
+) -> None:
+    """Save a scalar tensor heatmap with deterministic pixel dimensions."""
 
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -71,12 +77,19 @@ def save_heatmap(x: torch.Tensor, path: PathLike, normalize: bool = True) -> Non
             arr = (arr - lo) / (hi - lo)
         else:
             arr = np.zeros_like(arr)
-    fig, ax = plt.subplots(figsize=(4, 4))
-    ax.imshow(arr, cmap="magma")
-    ax.axis("off")
-    fig.tight_layout(pad=0)
-    fig.savefig(output, dpi=150, bbox_inches="tight", pad_inches=0)
-    plt.close(fig)
+    else:
+        arr = np.clip(arr, 0.0, 1.0)
+    rgba = plt.get_cmap(cmap)(arr, bytes=True)
+    image = Image.fromarray(rgba[..., :3], mode="RGB")
+    if target_size is not None and image.size != tuple(target_size):
+        image = image.resize(tuple(target_size), Image.BILINEAR)
+    image.save(output)
+
+
+def save_heatmap(x: torch.Tensor, path: PathLike, normalize: bool = True) -> None:
+    """Save a scalar tensor heatmap."""
+
+    save_heatmap_uint8(x, path, normalize=normalize)
 
 
 def make_contact_sheet(

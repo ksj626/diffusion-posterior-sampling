@@ -57,7 +57,12 @@ class SimpleHoleShiftTargetBuilder:
 
 
 class StructureProxTargetBuilder:
-    """Structure-proximal target builder for BCNS Step 1."""
+    """Structure-proximal target builder for BCNS Step 1.
+
+    ``target_mode="projected_mu"`` is a debug sanity mode and usually
+    produces zero hole displacement because the proximal objective starts from
+    ``hard_project_clean(mu, measurement, mask_known)``.
+    """
 
     def __init__(
         self,

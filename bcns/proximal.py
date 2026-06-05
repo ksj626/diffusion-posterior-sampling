@@ -74,6 +74,25 @@ def structure_image(x: torch.Tensor, sigma: float) -> torch.Tensor:
     return gaussian_smooth_depthwise(rgb_to_luminance_dps(x), sigma)
 
 
+def normalized_known_luminance_smooth(
+    measurement: torch.Tensor,
+    mask_known: torch.Tensor,
+    sigma: float,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Return normalized known-side smoothed luminance in DPS scale."""
+
+    validate_image_tensor(measurement, "measurement")
+    validate_mask_tensor(mask_known, measurement, "mask_known")
+    if eps <= 0:
+        raise ValueError("eps must be positive.")
+    lum = rgb_to_luminance_dps(measurement)
+    mask = mask_known.to(dtype=measurement.dtype)
+    numerator = gaussian_smooth_depthwise(mask * lum, sigma)
+    denominator = gaussian_smooth_depthwise(mask, sigma)
+    return numerator / (denominator + eps)
+
+
 def _target_structure(
     mu: torch.Tensor,
     measurement: torch.Tensor,
@@ -85,10 +104,13 @@ def _target_structure(
         return structure_image(hard_project_clean(mu, measurement, mask_known), structure_sigma)
     if target_mode == "measurement_only_smooth":
         return structure_image(measurement, structure_sigma)
+    if target_mode == "normalized_known_smooth":
+        return normalized_known_luminance_smooth(measurement, mask_known, structure_sigma)
     if target_mode == "mu":
         return structure_image(mu, structure_sigma)
     raise ValueError(
-        "target_mode must be one of 'projected_mu', 'measurement_only_smooth', or 'mu'."
+        "target_mode must be one of 'projected_mu', 'measurement_only_smooth', "
+        "'normalized_known_smooth', or 'mu'."
     )
 
 

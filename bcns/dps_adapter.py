@@ -75,6 +75,31 @@ def hard_project_clean(
     return mask * measurement + (1.0 - mask) * x_clean
 
 
+def clean_composite(
+    raw: torch.Tensor,
+    measurement: torch.Tensor,
+    mask_known: torch.Tensor,
+) -> torch.Tensor:
+    """Return final clean-space inpainting compositing."""
+
+    return hard_project_clean(raw, measurement, mask_known)
+
+
+def project_known_noisy(
+    x_t: torch.Tensor,
+    noisy_measurement: torch.Tensor,
+    mask_known: torch.Tensor,
+) -> torch.Tensor:
+    """Project known pixels to noisy measurement values during sampling."""
+
+    validate_image_tensor(x_t, "x_t")
+    if noisy_measurement.shape != x_t.shape:
+        raise ValueError("noisy_measurement must have the same shape as x_t.")
+    validate_mask_tensor(mask_known, x_t, "mask_known")
+    mask = mask_known.to(dtype=x_t.dtype)
+    return mask * noisy_measurement + (1.0 - mask) * x_t
+
+
 def masked_mean_square(
     x: torch.Tensor,
     mask: torch.Tensor,
@@ -90,3 +115,21 @@ def masked_mean_square(
     active = mask_f.expand_as(x)
     denom = active.sum().clamp_min(torch.as_tensor(eps, dtype=x.dtype, device=x.device))
     return ((x * active) ** 2).sum() / denom
+
+def split_known_hole_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask_known: torch.Tensor,
+) -> dict:
+    """Return known, hole, and full mean-square error scalar tensors."""
+
+    validate_image_tensor(pred, "pred")
+    if target.shape != pred.shape:
+        raise ValueError("target must have the same shape as pred.")
+    validate_mask_tensor(mask_known, pred, "mask_known")
+    diff = pred - target
+    known_mse = masked_mean_square(diff, mask_known)
+    hole_mse = masked_mean_square(diff, hole_from_known(mask_known))
+    full_mse = (diff ** 2).mean()
+    return {"known_mse": known_mse, "hole_mse": hole_mse, "full_mse": full_mse}
+

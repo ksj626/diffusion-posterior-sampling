@@ -1,3 +1,4 @@
+# NOTE: data.name remains ffhq because data/dataloader.py does not register an ImageNet dataset.
 conditioning:
   method: bcns_target
   params:
@@ -9,11 +10,12 @@ conditioning:
       structure_sigma: 1.0
       prox_steps: 1
       prox_step_size: 0.05
-      target_mode: projected_mu
+      target_mode: normalized_known_smooth
     gamma_max: 0.02
     tau2: 1.0
     pde_start_frac: 0.7
     ramp_power: 2.0
+    apply_noisy_known_projection: false
     debug: false
 
 data:

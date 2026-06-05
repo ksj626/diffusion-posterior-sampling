@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 import torch
 
+from bcns.dps_adapter import project_known_noisy
 from bcns.losses import target_discrepancy_loss
 from bcns.schedules import schedule_from_kwargs
 from bcns.target_builders import get_target_builder
@@ -27,10 +28,11 @@ class ConditioningMethod(ABC):
         self.noiser = noiser
     
     def project(self, data, noisy_measurement, **kwargs):
+        kwargs.pop('measurement', None)
         return self.operator.project(data=data, measurement=noisy_measurement, **kwargs)
     
     def grad_and_value(self, x_prev, x_0_hat, measurement, **kwargs):
-        if self.noiser.__name__ == 'gaussian':
+        if self.noiser.__name__ in ('gaussian', 'clean'):
             difference = measurement - self.operator.forward(x_0_hat, **kwargs)
             norm = torch.linalg.norm(difference)
             norm_grad = torch.autograd.grad(outputs=norm, inputs=x_prev)[0]
@@ -60,7 +62,7 @@ class Identity(ConditioningMethod):
 @register_conditioning_method(name='projection')
 class Projection(ConditioningMethod):
     def conditioning(self, x_t, noisy_measurement, **kwargs):
-        x_t = self.project(data=x_t, noisy_measurement=noisy_measurement)
+        x_t = self.project(data=x_t, noisy_measurement=noisy_measurement, **kwargs)
         return x_t
 
 
@@ -126,6 +128,7 @@ class BCNSTargetGuidance(ConditioningMethod):
             pde_start_frac=kwargs.get("pde_start_frac", 0.7),
             ramp_power=kwargs.get("ramp_power", 2.0),
         )
+        self.apply_noisy_known_projection = kwargs.get("apply_noisy_known_projection", False)
         self.debug = kwargs.get("debug", False)
         self.last_diagnostics = {}
 
@@ -133,12 +136,17 @@ class BCNSTargetGuidance(ConditioningMethod):
         t_index = kwargs.get("t_index", kwargs.get("idx", None))
         num_steps = kwargs.get("num_steps", None)
         if t_index is None or num_steps is None:
-            # TODO: pass sampler timestep/index into conditioning so the
-            # late-ramp schedule can be used during real BCNS guidance.
             return self.schedule.gamma_max, self.schedule.tau2
         gamma = self.schedule.gamma(int(t_index), int(num_steps))
         tau2 = self.schedule.tau2_value(int(t_index), int(num_steps))
         return gamma, tau2
+
+    def _project_if_requested(self, x_t, noisy_measurement, mask):
+        if not self.apply_noisy_known_projection:
+            return x_t
+        if noisy_measurement is None:
+            raise ValueError("apply_noisy_known_projection=True requires noisy_measurement.")
+        return project_known_noisy(x_t, noisy_measurement, mask)
 
     def conditioning(
         self,
@@ -146,6 +154,7 @@ class BCNSTargetGuidance(ConditioningMethod):
         x_t,
         x_0_hat,
         measurement,
+        noisy_measurement=None,
         mask=None,
         **kwargs,
     ):
@@ -155,6 +164,7 @@ class BCNSTargetGuidance(ConditioningMethod):
         gamma, tau2 = self._gamma_and_tau2(x_t, **kwargs)
         t_index = kwargs.get("t_index", kwargs.get("idx", None))
         if gamma == 0:
+            x_t = self._project_if_requested(x_t, noisy_measurement, mask)
             zero = torch.zeros((), device=x_t.device, dtype=x_t.dtype)
             self.last_diagnostics = {
                 "t_index": t_index,
@@ -163,9 +173,14 @@ class BCNSTargetGuidance(ConditioningMethod):
                 "loss": 0.0,
                 "grad_norm": 0.0,
                 "target_disp": 0.0,
+                "apply_noisy_known_projection": self.apply_noisy_known_projection,
             }
             if self.debug:
-                print(f"[BCNS] t={t_index} gamma={gamma:.6g} tau2={tau2:.6g} loss=0 grad=0 target_disp=0")
+                print(
+                    f"[BCNS] t={t_index} gamma={gamma:.6g} tau2={tau2:.6g} "
+                    f"loss=0 grad=0 target_disp=0 "
+                    f"project={self.apply_noisy_known_projection}"
+                )
             return x_t, zero
 
         result = self.target_builder(
@@ -185,6 +200,7 @@ class BCNSTargetGuidance(ConditioningMethod):
         grad = torch.autograd.grad(outputs=loss, inputs=x_prev, retain_graph=False)[0]
         grad_norm = torch.linalg.norm(grad.reshape(-1))
         x_t = x_t - self.scale * gamma * grad
+        x_t = self._project_if_requested(x_t, noisy_measurement, mask)
         self.last_diagnostics = {
             "t_index": t_index,
             "gamma": gamma,
@@ -194,11 +210,13 @@ class BCNSTargetGuidance(ConditioningMethod):
             "target_disp": float(target_disp.detach().item()),
         }
         self.last_diagnostics.update(result.diagnostics)
+        self.last_diagnostics["apply_noisy_known_projection"] = self.apply_noisy_known_projection
         if self.debug:
             print(
                 f"[BCNS] t={t_index} gamma={gamma:.6g} tau2={tau2:.6g} "
                 f"loss={self.last_diagnostics['loss']:.6g} "
                 f"grad={self.last_diagnostics['grad_norm']:.6g} "
-                f"target_disp={self.last_diagnostics['target_disp']:.6g}"
+                f"target_disp={self.last_diagnostics['target_disp']:.6g} "
+                f"project={self.apply_noisy_known_projection}"
             )
         return x_t, loss.detach()

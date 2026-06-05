@@ -15,7 +15,7 @@ from bcns.dps_adapter import hard_project_clean
 from bcns.masks import make_center_box_mask, make_thin_scratch_mask
 from bcns.proximal import structure_image
 from bcns.target_builders import get_target_builder
-from bcns.visualization import make_contact_sheet, save_heatmap, save_mask_image, save_tensor_image
+from bcns.visualization import make_contact_sheet, save_heatmap_uint8, save_mask_image, save_tensor_image
 
 
 def _synthetic_rgb(size: int = 96) -> torch.Tensor:
@@ -53,7 +53,7 @@ def main():
     labels.append("mask")
     save_mask_image(1.0 - scratch_unknown, output_dir / "mask_scratch.png")
 
-    save_heatmap(structure_image(mu, sigma=1.0), output_dir / "structure_mu.png")
+    save_heatmap_uint8(structure_image(mu, sigma=1.0), output_dir / "structure_mu.png", target_size=(96, 96))
     builders = {
         "identity": get_target_builder("identity"),
         "hard_projection": get_target_builder("hard_projection"),
@@ -64,7 +64,7 @@ def main():
             structure_sigma=1.0,
             prox_steps=3,
             prox_step_size=0.1,
-            target_mode="measurement_only_smooth",
+            target_mode="normalized_known_smooth",
         ),
     }
     for name, builder in builders.items():
@@ -74,8 +74,8 @@ def main():
         diff_path = output_dir / f"abs_diff_{name}.png"
         structure_path = output_dir / f"structure_target_{name}.png"
         save_tensor_image(target, target_path)
-        save_heatmap((target - mu).abs().mean(dim=1, keepdim=True), diff_path)
-        save_heatmap(structure_image(target, sigma=1.0), structure_path)
+        save_heatmap_uint8((target - mu).abs().mean(dim=1, keepdim=True), diff_path, target_size=(96, 96))
+        save_heatmap_uint8(structure_image(target, sigma=1.0), structure_path, target_size=(96, 96))
         saved_paths.extend([target_path, diff_path])
         labels.extend([f"target {name}", f"diff {name}"])
 
