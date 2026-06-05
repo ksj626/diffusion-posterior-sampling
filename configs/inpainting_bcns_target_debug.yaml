@@ -1,0 +1,25 @@
+conditioning:
+  method: bcns_target
+  params:
+    scale: 1.0
+    target_builder: identity
+    gamma_max: 0.05
+    tau2: 1.0
+    pde_start_frac: 0.0
+    ramp_power: 1.0
+
+data:
+  name: ffhq
+  root: ./data/samples/
+
+measurement:
+  operator:
+    name: inpainting
+  mask_opt:
+    mask_type: random
+    mask_prob_range: !!python/tuple [0.3, 0.7]
+    image_size: 256
+
+  noise:
+    name: gaussian
+    sigma: 0.05
