@@ -195,7 +195,10 @@ class GaussianDiffusion:
                                       measurement=measurement,
                                       noisy_measurement=noisy_measurement,
                                       x_prev=img,
-                                      x_0_hat=out['pred_xstart'])
+                                      x_0_hat=out['pred_xstart'],
+                                      t_index=int(idx),
+                                      num_steps=self.num_timesteps,
+                                      time=time)
             img = img.detach_()
            
             pbar.set_postfix({'distance': distance.item()}, refresh=False)

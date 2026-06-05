@@ -127,6 +127,7 @@ class BCNSTargetGuidance(ConditioningMethod):
             ramp_power=kwargs.get("ramp_power", 2.0),
         )
         self.debug = kwargs.get("debug", False)
+        self.last_diagnostics = {}
 
     def _gamma_and_tau2(self, x_t, **kwargs):
         t_index = kwargs.get("t_index", kwargs.get("idx", None))
@@ -152,15 +153,29 @@ class BCNSTargetGuidance(ConditioningMethod):
             raise ValueError("BCNSTargetGuidance requires DPS inpainting mask where mask == 1 is known.")
 
         gamma, tau2 = self._gamma_and_tau2(x_t, **kwargs)
+        t_index = kwargs.get("t_index", kwargs.get("idx", None))
         if gamma == 0:
-            return x_t, torch.zeros((), device=x_t.device, dtype=x_t.dtype)
+            zero = torch.zeros((), device=x_t.device, dtype=x_t.dtype)
+            self.last_diagnostics = {
+                "t_index": t_index,
+                "gamma": gamma,
+                "tau2": tau2,
+                "loss": 0.0,
+                "grad_norm": 0.0,
+                "target_disp": 0.0,
+            }
+            if self.debug:
+                print(f"[BCNS] t={t_index} gamma={gamma:.6g} tau2={tau2:.6g} loss=0 grad=0 target_disp=0")
+            return x_t, zero
 
         result = self.target_builder(
             mu=x_0_hat,
             measurement=measurement,
             mask_known=mask,
+            tau2=tau2,
         )
         target = result.target.detach()
+        target_disp = torch.linalg.norm((target - x_0_hat).reshape(-1))
         loss = target_discrepancy_loss(
             mu=x_0_hat,
             target=target,
@@ -168,5 +183,22 @@ class BCNSTargetGuidance(ConditioningMethod):
             tau2=tau2,
         )
         grad = torch.autograd.grad(outputs=loss, inputs=x_prev, retain_graph=False)[0]
+        grad_norm = torch.linalg.norm(grad.reshape(-1))
         x_t = x_t - self.scale * gamma * grad
+        self.last_diagnostics = {
+            "t_index": t_index,
+            "gamma": gamma,
+            "tau2": tau2,
+            "loss": float(loss.detach().item()),
+            "grad_norm": float(grad_norm.detach().item()),
+            "target_disp": float(target_disp.detach().item()),
+        }
+        self.last_diagnostics.update(result.diagnostics)
+        if self.debug:
+            print(
+                f"[BCNS] t={t_index} gamma={gamma:.6g} tau2={tau2:.6g} "
+                f"loss={self.last_diagnostics['loss']:.6g} "
+                f"grad={self.last_diagnostics['grad_norm']:.6g} "
+                f"target_disp={self.last_diagnostics['target_disp']:.6g}"
+            )
         return x_t, loss.detach()
