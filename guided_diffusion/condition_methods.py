@@ -66,6 +66,18 @@ class Projection(ConditioningMethod):
         return x_t
 
 
+@register_conditioning_method(name='projection_fixed')
+class FixedProjection(ConditioningMethod):
+    """Inpainting projection with explicit known-pixel replacement."""
+
+    def conditioning(self, x_t, noisy_measurement, mask=None, **kwargs):
+        if mask is None:
+            raise ValueError("projection_fixed requires DPS inpainting mask where mask == 1 is known.")
+        if noisy_measurement is None:
+            raise ValueError("projection_fixed requires noisy_measurement.")
+        return project_known_noisy(x_t, noisy_measurement, mask)
+
+
 @register_conditioning_method(name='mcg')
 class ManifoldConstraintGradient(ConditioningMethod):
     def __init__(self, operator, noiser, **kwargs):
@@ -79,6 +91,27 @@ class ManifoldConstraintGradient(ConditioningMethod):
         
         # projection
         x_t = self.project(data=x_t, noisy_measurement=noisy_measurement, **kwargs)
+        return x_t, norm
+
+
+@register_conditioning_method(name='mcg_fixed')
+class FixedManifoldConstraintGradient(ManifoldConstraintGradient):
+    """MCG baseline followed by explicit noisy known-pixel projection."""
+
+    def conditioning(self, x_prev, x_t, x_0_hat, measurement, noisy_measurement, mask=None, **kwargs):
+        if mask is None:
+            raise ValueError("mcg_fixed requires DPS inpainting mask where mask == 1 is known.")
+        if noisy_measurement is None:
+            raise ValueError("mcg_fixed requires noisy_measurement.")
+        norm_grad, norm = self.grad_and_value(
+            x_prev=x_prev,
+            x_0_hat=x_0_hat,
+            measurement=measurement,
+            mask=mask,
+            **kwargs,
+        )
+        x_t = x_t - norm_grad * self.scale
+        x_t = project_known_noisy(x_t, noisy_measurement, mask)
         return x_t, norm
         
 @register_conditioning_method(name='ps')

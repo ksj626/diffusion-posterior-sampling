@@ -114,23 +114,41 @@ def _target_structure(
     )
 
 
-def structure_proximal_target(
+def _validate_target_structure(target_structure: torch.Tensor, mu: torch.Tensor) -> None:
+    if not torch.is_tensor(target_structure):
+        raise TypeError("target_structure must be a torch.Tensor.")
+    if target_structure.ndim != 4 or target_structure.shape[1] != 1:
+        raise ValueError(
+            f"target_structure must have shape [B, 1, H, W], got {tuple(target_structure.shape)}."
+        )
+    if target_structure.shape[0] != mu.shape[0] or target_structure.shape[-2:] != mu.shape[-2:]:
+        raise ValueError("target_structure batch/spatial dimensions must match mu.")
+    if target_structure.device != mu.device:
+        raise ValueError("target_structure must be on the same device as mu.")
+    if target_structure.dtype != mu.dtype:
+        raise ValueError("target_structure must have the same dtype as mu.")
+    if not torch.is_floating_point(target_structure):
+        raise TypeError("target_structure must be a floating point tensor.")
+
+
+def structure_proximal_target_from_structure(
     mu: torch.Tensor,
     measurement: torch.Tensor,
     mask_known: torch.Tensor,
+    target_structure: torch.Tensor,
     tau2: float,
     lambda_structure: float,
     structure_sigma: float,
     prox_steps: int,
     prox_step_size: float,
-    target_mode: str = "projected_mu",
 ) -> StructureProxResult:
-    """Build a detached RGB structure-proximal target."""
+    """Build a detached RGB proximal target from an external scalar structure."""
 
     validate_image_tensor(mu, "mu")
     if measurement.shape != mu.shape:
         raise ValueError("measurement must have the same shape as mu.")
     validate_mask_tensor(mask_known, mu, "mask_known")
+    _validate_target_structure(target_structure, mu)
     if tau2 <= 0:
         raise ValueError("tau2 must be positive.")
     if lambda_structure < 0:
@@ -144,9 +162,7 @@ def structure_proximal_target(
 
     with torch.no_grad():
         projected = hard_project_clean(mu, measurement, mask_known)
-        target_structure = _target_structure(
-            mu, measurement, mask_known, structure_sigma, target_mode
-        ).detach()
+        target_structure = target_structure.detach()
         initial_structure = structure_image(projected, structure_sigma).detach()
 
     if prox_steps == 0 or lambda_structure == 0:
@@ -191,4 +207,38 @@ def structure_proximal_target(
         initial_structure=initial_structure,
         loss_history=loss_history,
         diagnostics=diagnostics,
+    )
+
+
+def structure_proximal_target(
+    mu: torch.Tensor,
+    measurement: torch.Tensor,
+    mask_known: torch.Tensor,
+    tau2: float,
+    lambda_structure: float,
+    structure_sigma: float,
+    prox_steps: int,
+    prox_step_size: float,
+    target_mode: str = "projected_mu",
+) -> StructureProxResult:
+    """Build a detached RGB structure-proximal target."""
+
+    validate_image_tensor(mu, "mu")
+    if measurement.shape != mu.shape:
+        raise ValueError("measurement must have the same shape as mu.")
+    validate_mask_tensor(mask_known, mu, "mask_known")
+    with torch.no_grad():
+        target_structure = _target_structure(
+            mu, measurement, mask_known, structure_sigma, target_mode
+        ).detach()
+    return structure_proximal_target_from_structure(
+        mu=mu,
+        measurement=measurement,
+        mask_known=mask_known,
+        target_structure=target_structure,
+        tau2=tau2,
+        lambda_structure=lambda_structure,
+        structure_sigma=structure_sigma,
+        prox_steps=prox_steps,
+        prox_step_size=prox_step_size,
     )

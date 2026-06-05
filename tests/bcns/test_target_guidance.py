@@ -95,5 +95,5 @@ def test_bcns_target_simple_hole_shift_changes_x_t_with_finite_loss():
 
 
 def test_existing_conditioning_methods_still_register():
-    for name in ("vanilla", "projection", "mcg", "ps", "ps+", "bcns_target"):
+    for name in ("vanilla", "projection", "projection_fixed", "mcg", "mcg_fixed", "ps", "ps+", "bcns_target"):
         get_conditioning_method(name, operator=None, noiser=_Noiser())
