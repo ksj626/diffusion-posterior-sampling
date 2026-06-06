@@ -5,10 +5,22 @@ from typing import Optional
 
 import torch
 
-from .dps_adapter import hard_project_clean, hole_from_known, validate_image_tensor, validate_mask_tensor
+from .dps_adapter import (
+    hard_project_clean,
+    hole_from_known,
+    masked_mean_square,
+    validate_image_tensor,
+    validate_mask_tensor,
+)
 from .flow_targets import build_flow_structure_target
+from .luminance_lift import luminance_lift_rgb_target
 from .poisson_targets import build_poisson_structure_target
-from .proximal import structure_proximal_target, structure_proximal_target_from_structure
+from .proximal import (
+    normalized_known_luminance_smooth,
+    structure_image,
+    structure_proximal_target,
+    structure_proximal_target_from_structure,
+)
 
 
 @dataclass
@@ -302,6 +314,106 @@ class FlowStructureTargetBuilder:
         )
 
 
+class LuminanceLiftTargetBuilder:
+    """Lift a scalar structure target directly into RGB hole displacement."""
+
+    def __init__(
+        self,
+        source: str = "flow",
+        lift_scale: float = 1.0,
+        mode: str = "equal_rgb",
+        **source_params,
+    ):
+        if source not in ("flow", "poisson", "harmonic", "normalized"):
+            raise ValueError("source must be one of 'flow', 'poisson', 'harmonic', or 'normalized'.")
+        self.source = source
+        self.lift_scale = float(lift_scale)
+        self.mode = mode
+        self.source_params = dict(source_params)
+
+    def _source_result(self, mu, measurement, mask_known, tau2):
+        if self.source == "flow":
+            return FlowStructureTargetBuilder(**self.source_params)(
+                mu=mu,
+                measurement=measurement,
+                mask_known=mask_known,
+                tau2=tau2,
+            )
+        if self.source == "poisson":
+            return PoissonStructureTargetBuilder(
+                target_builder="poisson_structure",
+                **self.source_params,
+            )(mu=mu, measurement=measurement, mask_known=mask_known, tau2=tau2)
+        if self.source == "harmonic":
+            return PoissonStructureTargetBuilder(
+                target_builder="harmonic_structure",
+                **self.source_params,
+            )(mu=mu, measurement=measurement, mask_known=mask_known, tau2=tau2)
+
+        structure_sigma = float(self.source_params.get("structure_sigma", 1.0))
+        target_structure = normalized_known_luminance_smooth(
+            measurement=measurement,
+            mask_known=mask_known,
+            sigma=structure_sigma,
+        ).detach()
+        initial_structure = structure_image(hard_project_clean(mu, measurement, mask_known), structure_sigma).detach()
+        return TargetBuildResult(
+            target=hard_project_clean(mu, measurement, mask_known).detach(),
+            diagnostics={
+                "target_builder": "normalized_known_smooth",
+                "structure_sigma": structure_sigma,
+            },
+            target_structure=target_structure,
+            initial_structure=initial_structure,
+        )
+
+    def __call__(self, mu, measurement, mask_known, **kwargs) -> TargetBuildResult:
+        validate_image_tensor(mu, "mu")
+        if measurement.shape != mu.shape:
+            raise ValueError("measurement must have the same shape as mu.")
+        validate_mask_tensor(mask_known, mu, "mask_known")
+        tau2 = kwargs.get("tau2", self.source_params.get("tau2", 1.0))
+        source_result = self._source_result(mu, measurement, mask_known, tau2)
+        if source_result.target_structure is None:
+            raise ValueError("luminance lift source did not provide a scalar target_structure.")
+        structure_sigma = float(self.source_params.get("structure_sigma", 1.0))
+        target_structure = source_result.target_structure.to(dtype=mu.dtype, device=mu.device)
+        target = luminance_lift_rgb_target(
+            mu=mu,
+            measurement=measurement,
+            mask_known=mask_known,
+            target_structure=target_structure,
+            structure_sigma=structure_sigma,
+            lift_scale=self.lift_scale,
+            mode=self.mode,
+        )
+        hole = hole_from_known(mask_known).to(dtype=mu.dtype)
+        scalar_hole = hole[:, :1, :, :]
+        target_disp_hole = torch.sqrt(masked_mean_square(target - mu, hole).detach().clamp_min(0.0))
+        structure_delta = target_structure.detach() - structure_image(mu, structure_sigma)
+        structure_disp_hole = torch.sqrt(
+            masked_mean_square(structure_delta, scalar_hole).detach().clamp_min(0.0)
+        )
+        diagnostics = dict(source_result.diagnostics)
+        diagnostics.update(
+            {
+                "target_builder": f"luminance_lift_{self.source}",
+                "lift_source": self.source,
+                "lift_scale": self.lift_scale,
+                "lift_mode": self.mode,
+                "structure_sigma": structure_sigma,
+                "target_disp_hole": float(target_disp_hole.item()),
+                "structure_disp_hole": float(structure_disp_hole.item()),
+            }
+        )
+        return TargetBuildResult(
+            target=target,
+            diagnostics=diagnostics,
+            target_structure=target_structure.detach(),
+            initial_structure=source_result.initial_structure,
+        )
+
+
 def get_target_builder(name: str, **kwargs):
     """Return a target builder by name."""
 
@@ -316,7 +428,22 @@ def get_target_builder(name: str, **kwargs):
         return PoissonStructureTargetBuilder(target_builder="harmonic_structure", **kwargs)
     if name == "poisson_structure":
         return PoissonStructureTargetBuilder(target_builder="poisson_structure", **kwargs)
+    if name == "luminance_lift_flow":
+        return LuminanceLiftTargetBuilder(source="flow", **kwargs)
+    if name == "luminance_lift_poisson":
+        return LuminanceLiftTargetBuilder(source="poisson", **kwargs)
+    if name == "luminance_lift_harmonic":
+        return LuminanceLiftTargetBuilder(source="harmonic", **kwargs)
     if name not in builders:
-        expected = sorted(list(builders) + ["harmonic_structure", "poisson_structure"])
+        expected = sorted(
+            list(builders)
+            + [
+                "harmonic_structure",
+                "poisson_structure",
+                "luminance_lift_flow",
+                "luminance_lift_poisson",
+                "luminance_lift_harmonic",
+            ]
+        )
         raise ValueError(f"Unsupported target builder {name!r}; expected one of {expected}.")
     return builders[name](**kwargs)

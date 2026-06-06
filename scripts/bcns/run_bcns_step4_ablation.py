@@ -129,6 +129,7 @@ def _poisson_params(
     prox_step_size: float = 0.05,
     rgb_loss_weight: float = 1.0,
     structure_loss_weight: float = 0.0,
+    gamma_max: float = 0.02,
 ):
     params = {
         "scale": 1.0,
@@ -146,7 +147,7 @@ def _poisson_params(
             "poisson_omega": 1.7,
             "poisson_h": 1.0,
         },
-        "gamma_max": 0.02,
+        "gamma_max": float(gamma_max),
         "tau2": 1.0,
         "pde_start_frac": 0.7,
         "ramp_power": 2.0,
@@ -173,6 +174,7 @@ def _flow_params(
     prox_step_size: float = 0.05,
     rgb_loss_weight: float = 1.0,
     structure_loss_weight: float = 0.0,
+    gamma_max: float = 0.02,
 ):
     return {
         "scale": 1.0,
@@ -201,7 +203,7 @@ def _flow_params(
             "check_cfl": True,
             "vorticity_boundary_mode": "none",
         },
-        "gamma_max": 0.02,
+        "gamma_max": float(gamma_max),
         "tau2": 1.0,
         "pde_start_frac": 0.7,
         "ramp_power": 2.0,
@@ -225,11 +227,67 @@ def _weight_suffix(weight: float) -> str:
     return f"_w{_float_tag(weight)}"
 
 
+def _gamma_label(value: float) -> str:
+    if abs(float(value) - 1.0) < 1e-12:
+        return "1.0"
+    return f"{float(value):g}"
+
+
+def _strength_weight_label(value: float) -> str:
+    return f"{float(value):g}"
+
+
+def _luminance_lift_params(
+    source: str,
+    lift_scale: float,
+    projected: bool = True,
+    gamma_max: float = 0.5,
+    mode: str = "equal_rgb",
+):
+    if source == "flow":
+        params = _flow_params(
+            "imex_be",
+            projected=projected,
+            apply_every_n_steps=5,
+            rgb_loss_weight=1.0,
+            structure_loss_weight=0.0,
+            gamma_max=gamma_max,
+        )
+        params["target_builder"] = "luminance_lift_flow"
+    elif source == "poisson":
+        params = _poisson_params(
+            "poisson_structure",
+            "sor_rb",
+            "projected_mu_laplacian",
+            projected=projected,
+            rgb_loss_weight=1.0,
+            structure_loss_weight=0.0,
+            gamma_max=gamma_max,
+        )
+        params["target_builder"] = "luminance_lift_poisson"
+    elif source == "harmonic":
+        params = _poisson_params(
+            "harmonic_structure",
+            "sor_rb",
+            "zero",
+            projected=projected,
+            rgb_loss_weight=1.0,
+            structure_loss_weight=0.0,
+            gamma_max=gamma_max,
+        )
+        params["target_builder"] = "luminance_lift_harmonic"
+    else:
+        raise ValueError("source must be one of 'flow', 'poisson', or 'harmonic'.")
+    params["target_builder_params"]["lift_scale"] = float(lift_scale)
+    params["target_builder_params"]["mode"] = mode
+    return params
+
+
 def _method(method, conditioning, params, **meta):
     return (method, conditioning, params, meta)
 
 
-def method_configs(ablation_set: str, scale_default: float):
+def method_configs(ablation_set: str, scale_default: float, full_strength_grid: bool = False):
     if ablation_set == "smoke":
         return [
             _method("ps", "ps", {"scale": scale_default}),
@@ -453,6 +511,153 @@ def method_configs(ablation_set: str, scale_default: float):
                 )
         return configs
 
+    if ablation_set == "guidance_strength":
+        gamma_values = (0.02, 0.1, 0.5, 1.0)
+        weight_values = (0.1, 1.0, 10.0, 50.0)
+        if full_strength_grid:
+            configs = []
+            for projected in (False, True):
+                for every in (5, 10):
+                    for gamma in gamma_values:
+                        for weight in weight_values:
+                            projected_tag = "_projected" if projected else ""
+                            name = (
+                                f"flow_struct{projected_tag}_g{_gamma_label(gamma)}"
+                                f"_w{_strength_weight_label(weight)}_every{every}"
+                            )
+                            configs.append(
+                                _method(
+                                    name,
+                                    "bcns_target",
+                                    _flow_params(
+                                        "imex_be",
+                                        projected=projected,
+                                        apply_every_n_steps=every,
+                                        rgb_loss_weight=0.0,
+                                        structure_loss_weight=weight,
+                                        gamma_max=gamma,
+                                    ),
+                                    ablation_gamma_max=float(gamma),
+                                    ablation_structure_loss_weight=float(weight),
+                                    ablation_apply_every_n_steps=int(every),
+                                    ablation_projected=bool(projected),
+                                )
+                            )
+            return configs
+
+        pairs = ((0.02, 0.1), (0.1, 1.0), (0.5, 10.0), (1.0, 50.0))
+        configs = []
+        for projected in (False, True):
+            for gamma, weight in pairs:
+                projected_tag = "_projected" if projected else ""
+                name = f"flow_struct{projected_tag}_g{_gamma_label(gamma)}_w{_strength_weight_label(weight)}"
+                configs.append(
+                    _method(
+                        name,
+                        "bcns_target",
+                        _flow_params(
+                            "imex_be",
+                            projected=projected,
+                            apply_every_n_steps=5,
+                            rgb_loss_weight=0.0,
+                            structure_loss_weight=weight,
+                            gamma_max=gamma,
+                        ),
+                        ablation_gamma_max=float(gamma),
+                        ablation_structure_loss_weight=float(weight),
+                        ablation_apply_every_n_steps=5,
+                        ablation_projected=bool(projected),
+                    )
+                )
+        return configs
+
+    if ablation_set == "flow_strength_extended":
+        settings = [
+            ("flow_weak", 0.003, 0.001, 0.1),
+            ("flow_mid", 0.01, 0.001, 0.1),
+            ("flow_strong", 0.03, 0.001, 0.2),
+            ("flow_very_strong", 0.1, 0.001, 0.2),
+        ]
+        return [
+            _method(
+                name,
+                "bcns_target",
+                _flow_params(
+                    "imex_be",
+                    dt=dt,
+                    pseudo_time=pseudo_time,
+                    nu=nu,
+                    projected=True,
+                    apply_every_n_steps=5,
+                    rgb_loss_weight=0.0,
+                    structure_loss_weight=10.0,
+                    gamma_max=0.5,
+                ),
+                sampling_steps=100,
+                ablation_pseudo_time=float(pseudo_time),
+                ablation_dt=float(dt),
+                ablation_nu=float(nu),
+                ablation_gamma_max=0.5,
+                ablation_structure_loss_weight=10.0,
+                ablation_apply_every_n_steps=5,
+            )
+            for name, pseudo_time, dt, nu in settings
+        ]
+
+    if ablation_set == "luminance_lift":
+        return [
+            _method("projection_fixed", "projection_fixed", {}, sampling_steps=100),
+            _method("ps", "ps", {"scale": scale_default}, sampling_steps=100),
+            _method(
+                "bcns_flow_struct_projected",
+                "bcns_target",
+                _flow_params(
+                    "imex_be",
+                    projected=True,
+                    apply_every_n_steps=5,
+                    rgb_loss_weight=0.0,
+                    structure_loss_weight=10.0,
+                    gamma_max=0.5,
+                ),
+                sampling_steps=100,
+            ),
+            _method(
+                "bcns_lift_flow_s0.5_projected",
+                "bcns_target",
+                _luminance_lift_params("flow", 0.5, projected=True),
+                sampling_steps=100,
+                ablation_lift_scale=0.5,
+            ),
+            _method(
+                "bcns_lift_flow_s1.0_projected",
+                "bcns_target",
+                _luminance_lift_params("flow", 1.0, projected=True),
+                sampling_steps=100,
+                ablation_lift_scale=1.0,
+            ),
+            _method(
+                "bcns_lift_flow_s2.0_projected",
+                "bcns_target",
+                _luminance_lift_params("flow", 2.0, projected=True),
+                sampling_steps=100,
+                ablation_lift_scale=2.0,
+            ),
+            _method(
+                "bcns_lift_poisson_s1.0_projected",
+                "bcns_target",
+                _luminance_lift_params("poisson", 1.0, projected=True),
+                sampling_steps=100,
+                ablation_lift_scale=1.0,
+            ),
+            _method(
+                "bcns_lift_harmonic_s1.0_projected",
+                "bcns_target",
+                _luminance_lift_params("harmonic", 1.0, projected=True),
+                sampling_steps=100,
+                ablation_lift_scale=1.0,
+            ),
+        ]
+
     raise ValueError(f"Unsupported ablation_set {ablation_set!r}.")
 
 
@@ -534,6 +739,12 @@ def write_method_diagnostics(method_dir, diagnostics):
         writer = csv.DictWriter(handle, fieldnames=keys)
         writer.writeheader()
         writer.writerow({key: diagnostics[key] for key in keys})
+
+
+def write_guidance_trace(method_dir, trace):
+    if not trace:
+        return
+    write_summary_csv([dict(row) for row in trace], method_dir / "guidance_trace.csv")
 
 
 def write_method_outputs(method_dir, measurement_noisy, mask, label, recon_raw, recon_composite):
@@ -658,10 +869,14 @@ def main():
             "guidance_activation",
             "proximal_strength",
             "fewstep",
+            "guidance_strength",
+            "flow_strength_extended",
+            "luminance_lift",
         ),
         default="smoke",
     )
     parser.add_argument("--sampling_steps", type=int, choices=ALLOWED_SAMPLING_STEPS, default=1000)
+    parser.add_argument("--full_strength_grid", action="store_true")
     parser.add_argument("--structural_sigma", type=float, default=1.0)
     parser.add_argument("--boundary_width", type=int, default=3)
     args = parser.parse_args()
@@ -697,7 +912,7 @@ def main():
     rows = []
     base_params = task_config.get("conditioning", {}).get("params", {})
     scale_default = float(base_params.get("scale", 1.0))
-    configs = method_configs(args.ablation_set, scale_default)
+    configs = method_configs(args.ablation_set, scale_default, full_strength_grid=args.full_strength_grid)
     write_config_used(root / "config_used.yaml", args, model_config, diffusion_config, task_config, configs)
 
     for image_index, ref_img in enumerate(loader):
@@ -725,6 +940,8 @@ def main():
             progress_dir = method_dir / "progress"
             progress_dir.mkdir(parents=True, exist_ok=True)
             cond_method = get_conditioning_method(conditioning_name, operator, noiser, **params)
+            if hasattr(cond_method, "reset_trace"):
+                cond_method.reset_trace()
             cond_fn = partial(cond_method.conditioning, mask=mask)
             set_seed(args.seed + image_index * 10007 + 777)
             x_start = x_start_base.clone().detach().requires_grad_()
@@ -741,7 +958,11 @@ def main():
                 desc=f"{image_id} {method_name}",
             )
             sample_runtime_sec = time.time() - start_time
-            diagnostics = getattr(cond_method, "last_diagnostics", {}) or {}
+            diagnostics = dict(getattr(cond_method, "last_diagnostics", {}) or {})
+            if hasattr(cond_method, "get_trace"):
+                write_guidance_trace(method_dir, cond_method.get_trace())
+            if hasattr(cond_method, "summarize_trace"):
+                diagnostics.update(cond_method.summarize_trace())
             write_method_diagnostics(method_dir, diagnostics)
             recon_composite = clean_composite(recon_raw, measurement_clean, mask)
             ordered, labels = write_method_outputs(

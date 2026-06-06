@@ -173,10 +173,83 @@ class BCNSTargetGuidance(ConditioningMethod):
         self.structure_loss_sigma = float(kwargs.get("structure_loss_sigma", 1.0))
         self.debug = kwargs.get("debug", False)
         self.last_diagnostics = {}
+        self.trace = []
         self._last_target = None
         self._last_target_structure = None
         self._last_initial_structure = None
         self._last_target_diagnostics = {}
+
+    def reset_trace(self):
+        self.trace = []
+
+    def get_trace(self):
+        return list(self.trace)
+
+    @staticmethod
+    def _mean(values):
+        return sum(values) / float(len(values)) if values else 0.0
+
+    def summarize_trace(self):
+        rows = self.get_trace()
+        grad_norms = [float(row.get("grad_norm", 0.0)) for row in rows]
+        update_norms = [float(row.get("update_norm", 0.0)) for row in rows]
+        rgb_losses = [float(row.get("rgb_loss", 0.0)) for row in rows]
+        structure_losses = [float(row.get("structure_loss", 0.0)) for row in rows]
+        target_disp_holes = [float(row.get("target_disp_hole", 0.0)) for row in rows]
+        structure_disp_holes = [float(row.get("structure_disp_hole", 0.0)) for row in rows]
+        return {
+            "num_guidance_calls": len(rows),
+            "num_target_recomputed": sum(1 for row in rows if bool(row.get("target_recomputed", False))),
+            "num_target_reused": sum(1 for row in rows if bool(row.get("target_reused", False))),
+            "num_nonzero_grad_steps": sum(1 for value in grad_norms if value > 0.0),
+            "mean_grad_norm": self._mean(grad_norms),
+            "max_grad_norm": max(grad_norms) if grad_norms else 0.0,
+            "sum_update_norm": sum(update_norms),
+            "mean_update_norm": self._mean(update_norms),
+            "max_update_norm": max(update_norms) if update_norms else 0.0,
+            "mean_rgb_loss": self._mean(rgb_losses),
+            "mean_structure_loss": self._mean(structure_losses),
+            "max_structure_loss": max(structure_losses) if structure_losses else 0.0,
+            "mean_target_disp_hole": self._mean(target_disp_holes),
+            "max_target_disp_hole": max(target_disp_holes) if target_disp_holes else 0.0,
+            "mean_structure_disp_hole": self._mean(structure_disp_holes),
+            "max_structure_disp_hole": max(structure_disp_holes) if structure_disp_holes else 0.0,
+        }
+
+    @staticmethod
+    def _trace_number(value):
+        if torch.is_tensor(value):
+            value = value.detach().item()
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, int):
+            return int(value)
+        return float(value)
+
+    def _append_trace(self, diagnostics):
+        keys = [
+            "t_index",
+            "num_steps",
+            "gamma",
+            "tau2",
+            "rgb_loss",
+            "structure_loss",
+            "total_loss",
+            "grad_norm",
+            "update_norm",
+            "target_disp_full",
+            "target_disp_known",
+            "target_disp_hole",
+            "target_mse_full",
+            "target_mse_known",
+            "target_mse_hole",
+            "structure_disp_hole",
+            "target_recomputed",
+            "target_reused",
+            "apply_noisy_known_projection",
+            "apply_every_n_steps",
+        ]
+        self.trace.append({key: self._trace_number(diagnostics.get(key, 0.0)) for key in keys})
 
     def _gamma_and_tau2(self, x_t, **kwargs):
         t_index = kwargs.get("t_index", kwargs.get("idx", None))
@@ -205,6 +278,7 @@ class BCNSTargetGuidance(ConditioningMethod):
         noisy_measurement,
         mask,
         t_index,
+        num_steps,
         gamma,
         tau2,
         target_recomputed=False,
@@ -214,6 +288,7 @@ class BCNSTargetGuidance(ConditioningMethod):
         zero = torch.zeros((), device=x_t.device, dtype=x_t.dtype)
         self.last_diagnostics = {
             "t_index": t_index,
+            "num_steps": num_steps,
             "gamma": gamma,
             "tau2": tau2,
             "loss": 0.0,
@@ -221,6 +296,7 @@ class BCNSTargetGuidance(ConditioningMethod):
             "structure_loss": 0.0,
             "total_loss": 0.0,
             "grad_norm": 0.0,
+            "update_norm": 0.0,
             "target_disp": 0.0,
             "target_disp_full": 0.0,
             "target_disp_known": 0.0,
@@ -237,6 +313,7 @@ class BCNSTargetGuidance(ConditioningMethod):
             "structure_loss_weight": self.structure_loss_weight,
             "structure_loss_sigma": self.structure_loss_sigma,
         }
+        self._append_trace(self.last_diagnostics)
         if self.debug:
             print(
                 f"[BCNS] t={t_index} gamma={gamma:.6g} tau2={tau2:.6g} "
@@ -261,6 +338,7 @@ class BCNSTargetGuidance(ConditioningMethod):
 
         gamma, tau2 = self._gamma_and_tau2(x_t, **kwargs)
         t_index = kwargs.get("t_index", kwargs.get("idx", None))
+        num_steps = kwargs.get("num_steps", None)
         selected = self._selected_for_target(t_index)
         if gamma == 0:
             return self._zero_return(
@@ -268,6 +346,7 @@ class BCNSTargetGuidance(ConditioningMethod):
                 noisy_measurement,
                 mask,
                 t_index,
+                num_steps,
                 gamma,
                 tau2,
                 target_recomputed=False,
@@ -308,6 +387,7 @@ class BCNSTargetGuidance(ConditioningMethod):
                 noisy_measurement,
                 mask,
                 t_index,
+                num_steps,
                 gamma,
                 tau2,
                 target_recomputed=False,
@@ -339,11 +419,14 @@ class BCNSTargetGuidance(ConditioningMethod):
             grad = torch.autograd.grad(outputs=loss, inputs=x_prev, retain_graph=False, allow_unused=True)[0]
             if grad is None:
                 grad = torch.zeros_like(x_prev)
+        update = self.scale * gamma * grad
         grad_norm = torch.linalg.norm(grad.reshape(-1))
-        x_t = x_t - self.scale * gamma * grad
+        update_norm = torch.linalg.norm(update.reshape(-1))
+        x_t = x_t - update
         x_t = self._project_if_requested(x_t, noisy_measurement, mask)
         self.last_diagnostics = {
             "t_index": t_index,
+            "num_steps": num_steps,
             "gamma": gamma,
             "tau2": tau2,
             "loss": float(loss.detach().item()),
@@ -351,6 +434,7 @@ class BCNSTargetGuidance(ConditioningMethod):
             "structure_loss": float(struct_diag["structure_loss"].detach().item()),
             "total_loss": float(loss.detach().item()),
             "grad_norm": float(grad_norm.detach().item()),
+            "update_norm": float(update_norm.detach().item()),
             "target_disp": float(disp_stats["target_disp_full"].detach().item()),
         }
         self.last_diagnostics.update(
@@ -367,6 +451,7 @@ class BCNSTargetGuidance(ConditioningMethod):
         self.last_diagnostics["rgb_loss_weight"] = self.rgb_loss_weight
         self.last_diagnostics["structure_loss_weight"] = self.structure_loss_weight
         self.last_diagnostics["structure_loss_sigma"] = self.structure_loss_sigma
+        self._append_trace(self.last_diagnostics)
         if self.debug:
             print(
                 f"[BCNS] t={t_index} gamma={gamma:.6g} tau2={tau2:.6g} "
