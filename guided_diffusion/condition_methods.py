@@ -2,7 +2,11 @@ from abc import ABC, abstractmethod
 import torch
 
 from bcns.dps_adapter import project_known_noisy
-from bcns.losses import target_discrepancy_loss
+from bcns.losses import (
+    structure_displacement_loss,
+    target_discrepancy_loss,
+    target_displacement_stats,
+)
 from bcns.schedules import schedule_from_kwargs
 from bcns.target_builders import get_target_builder
 
@@ -164,9 +168,14 @@ class BCNSTargetGuidance(ConditioningMethod):
         self.apply_noisy_known_projection = kwargs.get("apply_noisy_known_projection", False)
         self.apply_every_n_steps = int(kwargs.get("apply_every_n_steps", 1))
         self.reuse_last_target = kwargs.get("reuse_last_target", False)
+        self.rgb_loss_weight = float(kwargs.get("rgb_loss_weight", 1.0))
+        self.structure_loss_weight = float(kwargs.get("structure_loss_weight", 0.0))
+        self.structure_loss_sigma = float(kwargs.get("structure_loss_sigma", 1.0))
         self.debug = kwargs.get("debug", False)
         self.last_diagnostics = {}
         self._last_target = None
+        self._last_target_structure = None
+        self._last_initial_structure = None
         self._last_target_diagnostics = {}
 
     def _gamma_and_tau2(self, x_t, **kwargs):
@@ -208,12 +217,25 @@ class BCNSTargetGuidance(ConditioningMethod):
             "gamma": gamma,
             "tau2": tau2,
             "loss": 0.0,
+            "rgb_loss": 0.0,
+            "structure_loss": 0.0,
+            "total_loss": 0.0,
             "grad_norm": 0.0,
             "target_disp": 0.0,
+            "target_disp_full": 0.0,
+            "target_disp_known": 0.0,
+            "target_disp_hole": 0.0,
+            "target_mse_full": 0.0,
+            "target_mse_known": 0.0,
+            "target_mse_hole": 0.0,
+            "structure_disp_hole": 0.0,
             "apply_noisy_known_projection": self.apply_noisy_known_projection,
             "target_recomputed": bool(target_recomputed),
             "target_reused": bool(target_reused),
             "apply_every_n_steps": self.apply_every_n_steps,
+            "rgb_loss_weight": self.rgb_loss_weight,
+            "structure_loss_weight": self.structure_loss_weight,
+            "structure_loss_sigma": self.structure_loss_sigma,
         }
         if self.debug:
             print(
@@ -263,12 +285,21 @@ class BCNSTargetGuidance(ConditioningMethod):
                 tau2=tau2,
             )
             target = result.target.detach()
+            target_structure = None
+            initial_structure = None
+            if result.target_structure is not None:
+                target_structure = result.target_structure.detach()
+            if result.initial_structure is not None:
+                initial_structure = result.initial_structure.detach()
             result_diagnostics = dict(result.diagnostics)
             self._last_target = target
+            self._last_target_structure = target_structure
+            self._last_initial_structure = initial_structure
             self._last_target_diagnostics = dict(result_diagnostics)
             target_recomputed = True
         elif self.reuse_last_target and self._last_target is not None:
             target = self._last_target.detach()
+            target_structure = None if self._last_target_structure is None else self._last_target_structure.detach()
             result_diagnostics = dict(self._last_target_diagnostics)
             target_reused = True
         else:
@@ -283,14 +314,31 @@ class BCNSTargetGuidance(ConditioningMethod):
                 target_reused=False,
             )
 
-        target_disp = torch.linalg.norm((target - x_0_hat).reshape(-1))
-        loss = target_discrepancy_loss(
+        disp_stats = target_displacement_stats(
+            mu=x_0_hat,
+            target=target,
+            mask_known=mask,
+        )
+        rgb_loss = self.rgb_loss_weight * target_discrepancy_loss(
             mu=x_0_hat,
             target=target,
             mask_known=mask,
             tau2=tau2,
         )
-        grad = torch.autograd.grad(outputs=loss, inputs=x_prev, retain_graph=False)[0]
+        struct_loss, struct_diag = structure_displacement_loss(
+            mu=x_0_hat,
+            target_structure=target_structure,
+            mask_known=mask,
+            structure_sigma=self.structure_loss_sigma,
+            weight=self.structure_loss_weight,
+        )
+        loss = rgb_loss + struct_loss
+        if (not loss.requires_grad) or float(loss.detach().abs().item()) == 0.0:
+            grad = torch.zeros_like(x_prev)
+        else:
+            grad = torch.autograd.grad(outputs=loss, inputs=x_prev, retain_graph=False, allow_unused=True)[0]
+            if grad is None:
+                grad = torch.zeros_like(x_prev)
         grad_norm = torch.linalg.norm(grad.reshape(-1))
         x_t = x_t - self.scale * gamma * grad
         x_t = self._project_if_requested(x_t, noisy_measurement, mask)
@@ -299,20 +347,35 @@ class BCNSTargetGuidance(ConditioningMethod):
             "gamma": gamma,
             "tau2": tau2,
             "loss": float(loss.detach().item()),
+            "rgb_loss": float(rgb_loss.detach().item()),
+            "structure_loss": float(struct_diag["structure_loss"].detach().item()),
+            "total_loss": float(loss.detach().item()),
             "grad_norm": float(grad_norm.detach().item()),
-            "target_disp": float(target_disp.detach().item()),
+            "target_disp": float(disp_stats["target_disp_full"].detach().item()),
         }
+        self.last_diagnostics.update(
+            {key: float(value.detach().item()) for key, value in disp_stats.items()}
+        )
+        self.last_diagnostics["structure_disp_hole"] = float(
+            struct_diag["structure_disp_hole"].detach().item()
+        )
         self.last_diagnostics.update(result_diagnostics)
         self.last_diagnostics["apply_noisy_known_projection"] = self.apply_noisy_known_projection
         self.last_diagnostics["target_recomputed"] = bool(target_recomputed)
         self.last_diagnostics["target_reused"] = bool(target_reused)
         self.last_diagnostics["apply_every_n_steps"] = self.apply_every_n_steps
+        self.last_diagnostics["rgb_loss_weight"] = self.rgb_loss_weight
+        self.last_diagnostics["structure_loss_weight"] = self.structure_loss_weight
+        self.last_diagnostics["structure_loss_sigma"] = self.structure_loss_sigma
         if self.debug:
             print(
                 f"[BCNS] t={t_index} gamma={gamma:.6g} tau2={tau2:.6g} "
-                f"loss={self.last_diagnostics['loss']:.6g} "
+                f"loss={self.last_diagnostics['total_loss']:.6g} "
+                f"rgb={self.last_diagnostics['rgb_loss']:.6g} "
+                f"struct={self.last_diagnostics['structure_loss']:.6g} "
                 f"grad={self.last_diagnostics['grad_norm']:.6g} "
-                f"target_disp={self.last_diagnostics['target_disp']:.6g} "
+                f"target_hole={self.last_diagnostics['target_disp_hole']:.6g} "
+                f"struct_hole={self.last_diagnostics['structure_disp_hole']:.6g} "
                 f"recomputed={target_recomputed} reused={target_reused} "
                 f"every={self.apply_every_n_steps} project={self.apply_noisy_known_projection}"
             )

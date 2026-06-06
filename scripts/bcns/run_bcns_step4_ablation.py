@@ -4,10 +4,11 @@
 import argparse
 import copy
 import csv
+import math
 import random
 import sys
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from functools import partial
 from pathlib import Path
 
@@ -37,10 +38,30 @@ from guided_diffusion.measurements import get_noise, get_operator
 from guided_diffusion.unet import create_model
 from util.img_utils import mask_generator
 
+ALLOWED_SAMPLING_STEPS = (25, 50, 100, 250, 1000)
+
 
 def load_yaml(path: str) -> dict:
     with open(path) as handle:
         return yaml.load(handle, Loader=yaml.FullLoader)
+
+
+def validate_sampling_steps(sampling_steps: int) -> int:
+    sampling_steps = int(sampling_steps)
+    if sampling_steps not in ALLOWED_SAMPLING_STEPS:
+        raise ValueError(f"sampling_steps must be one of {ALLOWED_SAMPLING_STEPS}, got {sampling_steps}.")
+    return sampling_steps
+
+
+def diffusion_config_for_sampling_steps(diffusion_config: dict, sampling_steps: int) -> dict:
+    sampling_steps = validate_sampling_steps(sampling_steps)
+    config = copy.deepcopy(diffusion_config)
+    config["timestep_respacing"] = str(sampling_steps)
+    return config
+
+
+def create_sampler_for_sampling_steps(diffusion_config: dict, sampling_steps: int):
+    return create_sampler(**diffusion_config_for_sampling_steps(diffusion_config, sampling_steps))
 
 
 def set_seed(seed: int) -> None:
@@ -57,7 +78,24 @@ def assert_checkpoint_exists(model_config: dict) -> None:
         raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
 
 
-def _structure_params(projected: bool = True):
+def _add_guidance_weights(
+    params,
+    rgb_loss_weight: float = 1.0,
+    structure_loss_weight: float = 0.0,
+    structure_loss_sigma: float = 1.0,
+):
+    params = copy.deepcopy(params)
+    params["rgb_loss_weight"] = float(rgb_loss_weight)
+    params["structure_loss_weight"] = float(structure_loss_weight)
+    params["structure_loss_sigma"] = float(structure_loss_sigma)
+    return params
+
+
+def _structure_params(
+    projected: bool = True,
+    rgb_loss_weight: float = 1.0,
+    structure_loss_weight: float = 0.0,
+):
     return {
         "scale": 1.0,
         "target_builder": "structure_prox",
@@ -74,6 +112,9 @@ def _structure_params(projected: bool = True):
         "pde_start_frac": 0.7,
         "ramp_power": 2.0,
         "apply_noisy_known_projection": bool(projected),
+        "rgb_loss_weight": float(rgb_loss_weight),
+        "structure_loss_weight": float(structure_loss_weight),
+        "structure_loss_sigma": 1.0,
     }
 
 
@@ -83,16 +124,21 @@ def _poisson_params(
     rhs_mode: str = None,
     projected: bool = True,
     poisson_max_iter: int = 200,
+    lambda_structure: float = 0.05,
+    prox_steps: int = 1,
+    prox_step_size: float = 0.05,
+    rgb_loss_weight: float = 1.0,
+    structure_loss_weight: float = 0.0,
 ):
     params = {
         "scale": 1.0,
         "target_builder": target_builder,
         "target_builder_params": {
             "tau2": 1.0,
-            "lambda_structure": 0.05,
+            "lambda_structure": float(lambda_structure),
             "structure_sigma": 1.0,
-            "prox_steps": 1,
-            "prox_step_size": 0.05,
+            "prox_steps": int(prox_steps),
+            "prox_step_size": float(prox_step_size),
             "boundary_mode": "normalized_known_smooth",
             "poisson_method": poisson_method,
             "poisson_max_iter": int(poisson_max_iter),
@@ -105,6 +151,9 @@ def _poisson_params(
         "pde_start_frac": 0.7,
         "ramp_power": 2.0,
         "apply_noisy_known_projection": bool(projected),
+        "rgb_loss_weight": float(rgb_loss_weight),
+        "structure_loss_weight": float(structure_loss_weight),
+        "structure_loss_sigma": 1.0,
     }
     if rhs_mode is not None:
         params["target_builder_params"]["rhs_mode"] = rhs_mode
@@ -119,16 +168,21 @@ def _flow_params(
     projected: bool = True,
     apply_every_n_steps: int = 10,
     reuse_last_target: bool = False,
+    lambda_structure: float = 0.05,
+    prox_steps: int = 1,
+    prox_step_size: float = 0.05,
+    rgb_loss_weight: float = 1.0,
+    structure_loss_weight: float = 0.0,
 ):
     return {
         "scale": 1.0,
         "target_builder": "flow_structure",
         "target_builder_params": {
             "tau2": 1.0,
-            "lambda_structure": 0.05,
+            "lambda_structure": float(lambda_structure),
             "structure_sigma": 1.0,
-            "prox_steps": 1,
-            "prox_step_size": 0.05,
+            "prox_steps": int(prox_steps),
+            "prox_step_size": float(prox_step_size),
             "initial_mode": "projected_mu",
             "boundary_mode": "normalized_known_smooth",
             "boundary_vorticity_mode": "none",
@@ -154,12 +208,21 @@ def _flow_params(
         "apply_noisy_known_projection": bool(projected),
         "apply_every_n_steps": int(apply_every_n_steps),
         "reuse_last_target": bool(reuse_last_target),
+        "rgb_loss_weight": float(rgb_loss_weight),
+        "structure_loss_weight": float(structure_loss_weight),
+        "structure_loss_sigma": 1.0,
     }
 
 
 def _float_tag(value: float) -> str:
     text = f"{float(value):g}"
     return text.replace("-", "m").replace("+", "").replace(".", "p").replace("e", "e")
+
+
+def _weight_suffix(weight: float) -> str:
+    if abs(float(weight) - 0.1) < 1e-12:
+        return ""
+    return f"_w{_float_tag(weight)}"
 
 
 def _method(method, conditioning, params, **meta):
@@ -263,6 +326,132 @@ def method_configs(ablation_set: str, scale_default: float):
                 _poisson_params("poisson_structure", "sor_rb", "projected_mu_laplacian", projected=True),
             ),
         ]
+
+    if ablation_set == "guidance_activation":
+        configs = [
+            _method("projection_fixed", "projection_fixed", {}),
+            _method("ps", "ps", {"scale": scale_default}),
+            _method(
+                "bcns_flow_rgb_only_projected",
+                "bcns_target",
+                _flow_params("imex_be", rgb_loss_weight=1.0, structure_loss_weight=0.0),
+                ablation_rgb_loss_weight=1.0,
+                ablation_structure_loss_weight=0.0,
+            ),
+        ]
+        for weight in (0.03, 0.1, 0.3):
+            suffix = _weight_suffix(weight)
+            configs.extend(
+                [
+                    _method(
+                        f"bcns_flow_struct_only_projected{suffix}",
+                        "bcns_target",
+                        _flow_params("imex_be", rgb_loss_weight=0.0, structure_loss_weight=weight),
+                        ablation_rgb_loss_weight=0.0,
+                        ablation_structure_loss_weight=float(weight),
+                    ),
+                    _method(
+                        f"bcns_flow_rgb_struct_projected{suffix}",
+                        "bcns_target",
+                        _flow_params("imex_be", rgb_loss_weight=1.0, structure_loss_weight=weight),
+                        ablation_rgb_loss_weight=1.0,
+                        ablation_structure_loss_weight=float(weight),
+                    ),
+                    _method(
+                        f"bcns_poisson_struct_only_projected{suffix}",
+                        "bcns_target",
+                        _poisson_params(
+                            "poisson_structure",
+                            "sor_rb",
+                            "projected_mu_laplacian",
+                            rgb_loss_weight=0.0,
+                            structure_loss_weight=weight,
+                        ),
+                        ablation_rgb_loss_weight=0.0,
+                        ablation_structure_loss_weight=float(weight),
+                    ),
+                    _method(
+                        f"bcns_harmonic_struct_only_projected{suffix}",
+                        "bcns_target",
+                        _poisson_params(
+                            "harmonic_structure",
+                            "sor_rb",
+                            "zero",
+                            rgb_loss_weight=0.0,
+                            structure_loss_weight=weight,
+                        ),
+                        ablation_rgb_loss_weight=0.0,
+                        ablation_structure_loss_weight=float(weight),
+                    ),
+                ]
+            )
+        return configs
+
+    if ablation_set == "proximal_strength":
+        configs = []
+        settings = [
+            ("weak", 0.05, 1, 0.05),
+            ("mid", 0.5, 3, 0.1),
+            ("strong", 2.0, 5, 0.1),
+        ]
+        for label, lambda_structure, prox_steps, prox_step_size in settings:
+            for structure_weight in (0.0, 0.1):
+                suffix = "" if structure_weight == 0.0 else "_struct"
+                configs.append(
+                    _method(
+                        f"bcns_flow_{label}{suffix}",
+                        "bcns_target",
+                        _flow_params(
+                            "imex_be",
+                            lambda_structure=lambda_structure,
+                            prox_steps=prox_steps,
+                            prox_step_size=prox_step_size,
+                            rgb_loss_weight=1.0,
+                            structure_loss_weight=structure_weight,
+                        ),
+                        ablation_lambda_structure=float(lambda_structure),
+                        ablation_prox_steps=int(prox_steps),
+                        ablation_prox_step_size=float(prox_step_size),
+                        ablation_rgb_loss_weight=1.0,
+                        ablation_structure_loss_weight=float(structure_weight),
+                    )
+                )
+        return configs
+
+    if ablation_set == "fewstep":
+        configs = []
+        for sampling_steps in ALLOWED_SAMPLING_STEPS:
+            for method_name, conditioning_name, params in (
+                ("ps", "ps", {"scale": scale_default}),
+                ("projection_fixed", "projection_fixed", {}),
+                ("mcg_fixed", "mcg_fixed", {"scale": scale_default}),
+                (
+                    "bcns_flow_struct_projected",
+                    "bcns_target",
+                    _flow_params("imex_be", rgb_loss_weight=0.0, structure_loss_weight=0.1),
+                ),
+                (
+                    "bcns_poisson_struct_projected",
+                    "bcns_target",
+                    _poisson_params(
+                        "poisson_structure",
+                        "sor_rb",
+                        "projected_mu_laplacian",
+                        rgb_loss_weight=0.0,
+                        structure_loss_weight=0.1,
+                    ),
+                ),
+            ):
+                configs.append(
+                    _method(
+                        method_name,
+                        conditioning_name,
+                        params,
+                        sampling_steps=int(sampling_steps),
+                        ablation_sampling_steps=int(sampling_steps),
+                    )
+                )
+        return configs
 
     raise ValueError(f"Unsupported ablation_set {ablation_set!r}.")
 
@@ -410,6 +599,40 @@ def write_config_used(path, args, model_config, diffusion_config, task_config, c
         yaml.dump(payload, handle, sort_keys=False)
 
 
+def _numeric(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def summarize_by_keys(rows, group_keys):
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[tuple(row.get(key, "") for key in group_keys)].append(row)
+
+    summaries = []
+    for group in sorted(grouped.keys()):
+        group_rows = grouped[group]
+        summary = OrderedDict()
+        for key, value in zip(group_keys, group):
+            summary[key] = value
+        summary["count"] = len(group_rows)
+        keys = sorted({key for row in group_rows for key in row.keys()})
+        for key in keys:
+            if key in group_keys:
+                continue
+            values = [float(row[key]) for row in group_rows if key in row and _numeric(row[key])]
+            if not values:
+                continue
+            mean = sum(values) / float(len(values))
+            summary[f"{key}_mean"] = mean
+            if len(values) > 1:
+                var = sum((value - mean) ** 2 for value in values) / float(len(values) - 1)
+                summary[f"{key}_std"] = math.sqrt(var)
+            else:
+                summary[f"{key}_std"] = 0.0
+        summaries.append(dict(summary))
+    return summaries
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_config", required=True)
@@ -425,9 +648,20 @@ def main():
     parser.add_argument("--scratch_thickness", type=int, default=5)
     parser.add_argument(
         "--ablation_set",
-        choices=("smoke", "flow_integrator", "flow_strength", "frequency", "poisson_solver", "projection_effect"),
+        choices=(
+            "smoke",
+            "flow_integrator",
+            "flow_strength",
+            "frequency",
+            "poisson_solver",
+            "projection_effect",
+            "guidance_activation",
+            "proximal_strength",
+            "fewstep",
+        ),
         default="smoke",
     )
+    parser.add_argument("--sampling_steps", type=int, choices=ALLOWED_SAMPLING_STEPS, default=1000)
     parser.add_argument("--structural_sigma", type=float, default=1.0)
     parser.add_argument("--boundary_width", type=int, default=3)
     args = parser.parse_args()
@@ -443,7 +677,13 @@ def main():
     model.eval()
     operator = get_operator(device=device, **task_config["measurement"]["operator"])
     noiser = get_noise(**task_config["measurement"]["noise"])
-    sampler = create_sampler(**diffusion_config)
+    sampler_cache = {}
+
+    def sampler_for_steps(sampling_steps: int):
+        sampling_steps = validate_sampling_steps(sampling_steps)
+        if sampling_steps not in sampler_cache:
+            sampler_cache[sampling_steps] = create_sampler_for_sampling_steps(diffusion_config, sampling_steps)
+        return sampler_cache[sampling_steps]
 
     transform = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
@@ -464,18 +704,23 @@ def main():
         if image_index >= args.num_images:
             break
         image_id = str(image_index).zfill(5)
-        image_dir = root / image_id
-        image_dir.mkdir(parents=True, exist_ok=True)
+        if args.ablation_set != "fewstep":
+            image_dir = root / image_id
+            image_dir.mkdir(parents=True, exist_ok=True)
         ref_img = ref_img.to(device)
         set_seed(args.seed + image_index)
         mask = make_mask(args, mask_gen, ref_img)
         measurement_clean = operator.forward(ref_img, mask=mask)
         measurement_noisy = noiser(measurement_clean)
         x_start_base = torch.randn(ref_img.shape, device=device)
-        comparison_paths = []
-        comparison_labels = []
+        comparison_groups = defaultdict(lambda: {"paths": [], "labels": []})
 
         for method_name, conditioning_name, params, meta in configs:
+            sampling_steps = int(meta.get("sampling_steps", args.sampling_steps))
+            sampler = sampler_for_steps(sampling_steps)
+            run_root = root / f"steps_{sampling_steps:04d}" if args.ablation_set == "fewstep" else root
+            image_dir = run_root / image_id
+            image_dir.mkdir(parents=True, exist_ok=True)
             method_dir = image_dir / method_name
             progress_dir = method_dir / "progress"
             progress_dir.mkdir(parents=True, exist_ok=True)
@@ -502,8 +747,9 @@ def main():
             ordered, labels = write_method_outputs(
                 method_dir, measurement_noisy, mask, ref_img, recon_raw, recon_composite
             )
-            comparison_paths.extend(ordered)
-            comparison_labels.extend([f"{method_name} {label}" for label in labels])
+            group_key = (run_root, image_id)
+            comparison_groups[group_key]["paths"].extend(ordered)
+            comparison_groups[group_key]["labels"].extend([f"{method_name} {label}" for label in labels])
 
             row = OrderedDict()
             row["image_index"] = image_index
@@ -513,6 +759,8 @@ def main():
             row["ablation_set"] = args.ablation_set
             row["seed"] = args.seed
             row["mask_mode"] = args.mask_mode
+            row["sampling_steps"] = sampling_steps
+            row["actual_num_reverse_updates"] = int(sampler.num_timesteps)
             row["final_loss"] = float(final_loss.item())
             row["sample_runtime_sec"] = float(sample_runtime_sec)
             row.update(meta)
@@ -534,15 +782,16 @@ def main():
             row["has_nan"] = bool(torch.isnan(recon_raw).any().item() or torch.isnan(recon_composite).any().item())
             rows.append(dict(row))
 
-        make_contact_sheet(
-            comparison_paths,
-            comparison_labels,
-            image_dir / "comparison_contact_sheet.png",
-            cols=7,
-        )
+        for (run_root, grouped_image_id), group in comparison_groups.items():
+            make_contact_sheet(
+                group["paths"],
+                group["labels"],
+                run_root / grouped_image_id / "comparison_contact_sheet.png",
+                cols=7,
+            )
 
     write_summary_csv(rows, root / "metrics.csv")
-    summary = summarize_by_method(rows)
+    summary = summarize_by_keys(rows, ("sampling_steps", "method")) if args.ablation_set == "fewstep" else summarize_by_method(rows)
     write_summary_csv(summary, root / "summary_by_method.csv")
     write_summary_markdown(summary, root / "summary_by_method.md")
     print(f"Wrote Step 4 ablation outputs to {root}")

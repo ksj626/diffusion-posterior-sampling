@@ -1,6 +1,7 @@
 """Debug and structure target builders for BCNS target-guidance conditioning."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -16,6 +17,8 @@ class TargetBuildResult:
 
     target: torch.Tensor
     diagnostics: dict
+    target_structure: Optional[torch.Tensor] = None
+    initial_structure: Optional[torch.Tensor] = None
 
 
 class IdentityTargetBuilder:
@@ -98,7 +101,12 @@ class StructureProxTargetBuilder:
             "prox_final_loss": result.diagnostics["prox_final_loss"],
             "target_disp": result.diagnostics["target_disp"],
         }
-        return TargetBuildResult(target=result.target, diagnostics=diagnostics)
+        return TargetBuildResult(
+            target=result.target,
+            diagnostics=diagnostics,
+            target_structure=result.target_structure,
+            initial_structure=result.initial_structure,
+        )
 
 
 class PoissonStructureTargetBuilder:
@@ -179,7 +187,12 @@ class PoissonStructureTargetBuilder:
         diagnostics.update(poisson_result.diagnostics)
         diagnostics["poisson_structure_disp"] = poisson_result.diagnostics.get("target_disp")
         diagnostics["target_disp"] = prox_result.diagnostics["target_disp"]
-        return TargetBuildResult(target=prox_result.target, diagnostics=diagnostics)
+        return TargetBuildResult(
+            target=prox_result.target,
+            diagnostics=diagnostics,
+            target_structure=poisson_result.structure.to(dtype=mu.dtype, device=mu.device),
+            initial_structure=prox_result.initial_structure,
+        )
 
 
 class FlowStructureTargetBuilder:
@@ -281,7 +294,12 @@ class FlowStructureTargetBuilder:
         }
         diagnostics.update(flow_result.diagnostics)
         diagnostics["target_disp"] = prox_result.diagnostics["target_disp"]
-        return TargetBuildResult(target=prox_result.target, diagnostics=diagnostics)
+        return TargetBuildResult(
+            target=prox_result.target,
+            diagnostics=diagnostics,
+            target_structure=flow_result.structure.to(dtype=mu.dtype, device=mu.device),
+            initial_structure=prox_result.initial_structure,
+        )
 
 
 def get_target_builder(name: str, **kwargs):

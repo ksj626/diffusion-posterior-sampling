@@ -1,0 +1,44 @@
+conditioning:
+  method: bcns_target
+  params:
+    scale: 1.0
+    target_builder: harmonic_structure
+    target_builder_params:
+      tau2: 1.0
+      lambda_structure: 0.05
+      structure_sigma: 1.0
+      prox_steps: 1
+      prox_step_size: 0.05
+      boundary_mode: normalized_known_smooth
+      poisson_method: sor_rb
+      poisson_max_iter: 200
+      poisson_tol: 1.0e-4
+      poisson_omega: 1.7
+      poisson_h: 1.0
+      rhs_mode: zero
+    gamma_max: 0.02
+    tau2: 1.0
+    pde_start_frac: 0.7
+    ramp_power: 2.0
+    apply_noisy_known_projection: true
+    apply_every_n_steps: 10
+    reuse_last_target: false
+    rgb_loss_weight: 0.0
+    structure_loss_weight: 0.1
+    structure_loss_sigma: 1.0
+    debug: false
+
+data:
+  name: ffhq
+  root: ./data/samples/
+
+measurement:
+  operator:
+    name: inpainting
+  mask_opt:
+    mask_type: random
+    mask_prob_range: !!python/tuple [0.3, 0.7]
+    image_size: 256
+
+  noise:
+    name: clean
