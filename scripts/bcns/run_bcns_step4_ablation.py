@@ -29,7 +29,15 @@ from bcns.eval_table import (
     write_summary_csv,
     write_summary_markdown,
 )
-from bcns.masks import make_center_box_mask, make_thin_scratch_mask
+from bcns.masks import (
+    make_center_box_mask,
+    make_center_box_unknown_mask,
+    make_freeform_medium_mask,
+    make_text_like_mask,
+    make_thick_scratch_mask,
+    make_thin_scratch_mask,
+    mask_metadata,
+)
 from bcns.visualization import make_contact_sheet, save_heatmap_uint8, save_mask_image, save_tensor_image
 from data.dataloader import get_dataloader, get_dataset
 from guided_diffusion.condition_methods import get_conditioning_method
@@ -237,6 +245,13 @@ def _strength_weight_label(value: float) -> str:
     return f"{float(value):g}"
 
 
+def _lift_label(value: float) -> str:
+    value = float(value)
+    if abs(value - round(value)) < 1e-12:
+        return f"{value:.1f}"
+    return f"{value:g}"
+
+
 def _luminance_lift_params(
     source: str,
     lift_scale: float,
@@ -278,6 +293,8 @@ def _luminance_lift_params(
         params["target_builder"] = "luminance_lift_harmonic"
     else:
         raise ValueError("source must be one of 'flow', 'poisson', or 'harmonic'.")
+    params["pde_start_frac"] = 0.5
+    params["apply_every_n_steps"] = 5
     params["target_builder_params"]["lift_scale"] = float(lift_scale)
     params["target_builder_params"]["mode"] = mode
     return params
@@ -285,6 +302,89 @@ def _luminance_lift_params(
 
 def _method(method, conditioning, params, **meta):
     return (method, conditioning, params, meta)
+
+
+def _method_plot_metadata(method_name: str, conditioning_name: str, params: dict) -> dict:
+    target_builder = params.get("target_builder", "")
+    target_params = params.get("target_builder_params", {}) if isinstance(params, dict) else {}
+    if conditioning_name == "ps":
+        family = "ps"
+    elif conditioning_name == "projection_fixed":
+        family = "projection"
+    elif conditioning_name == "mcg_fixed":
+        family = "mcg"
+    elif target_builder.startswith("luminance_lift"):
+        family = "bcns_lift"
+    elif target_builder == "flow_structure":
+        family = "bcns_flow"
+    elif target_builder == "poisson_structure":
+        family = "bcns_poisson"
+    elif target_builder == "harmonic_structure":
+        family = "bcns_harmonic"
+    else:
+        family = "bcns" if conditioning_name == "bcns_target" else conditioning_name
+
+    if "harmonic" in target_builder:
+        source = "harmonic"
+    elif "poisson" in target_builder:
+        source = "poisson"
+    elif "flow" in target_builder:
+        source = "flow"
+    elif target_builder == "structure_prox":
+        source = target_params.get("target_mode", "normalized")
+    else:
+        source = "none"
+
+    if target_builder.startswith("luminance_lift"):
+        transfer = "luminance_lift"
+    elif conditioning_name != "bcns_target":
+        transfer = "none"
+    elif float(params.get("structure_loss_weight", 0.0)) > 0.0 and float(params.get("rgb_loss_weight", 1.0)) == 0.0:
+        transfer = "structure_loss"
+    else:
+        transfer = "rgb_prox"
+
+    return {
+        "method_family": family,
+        "target_source": source,
+        "transfer_mode": transfer,
+        "projected": bool(params.get("apply_noisy_known_projection", False)),
+        "lift_scale": target_params.get("lift_scale", ""),
+    }
+
+
+def _method_with_metadata(method, conditioning, params, **meta):
+    merged = _method_plot_metadata(method, conditioning, params)
+    merged.update(meta)
+    return _method(method, conditioning, params, **merged)
+
+
+def _lift_candidate_configs(scale_default: float):
+    configs = [
+        _method_with_metadata("ps", "ps", {"scale": scale_default}),
+        _method_with_metadata("projection_fixed", "projection_fixed", {}),
+        _method_with_metadata("mcg_fixed", "mcg_fixed", {"scale": scale_default}),
+    ]
+    for source in ("harmonic", "poisson"):
+        for lift_scale in (0.5, 1.0, 2.0):
+            configs.append(
+                _method_with_metadata(
+                    f"bcns_lift_{source}_s{_lift_label(lift_scale)}",
+                    "bcns_target",
+                    _luminance_lift_params(source, lift_scale, projected=False, gamma_max=0.5),
+                    ablation_lift_scale=float(lift_scale),
+                )
+            )
+    for source in ("harmonic", "poisson"):
+        configs.append(
+            _method_with_metadata(
+                f"bcns_lift_{source}_s1.0_projected",
+                "bcns_target",
+                _luminance_lift_params(source, 1.0, projected=True, gamma_max=0.5),
+                ablation_lift_scale=1.0,
+            )
+        )
+    return configs
 
 
 def method_configs(ablation_set: str, scale_default: float, full_strength_grid: bool = False):
@@ -658,6 +758,65 @@ def method_configs(ablation_set: str, scale_default: float, full_strength_grid: 
             ),
         ]
 
+    if ablation_set == "lift_candidates":
+        return _lift_candidate_configs(scale_default)
+
+    if ablation_set == "lift_fewstep":
+        configs = []
+        for sampling_steps in ALLOWED_SAMPLING_STEPS:
+            for method_name, conditioning_name, params in (
+                ("ps", "ps", {"scale": scale_default}),
+                ("projection_fixed", "projection_fixed", {}),
+                ("mcg_fixed", "mcg_fixed", {"scale": scale_default}),
+                (
+                    "bcns_lift_harmonic_s1.0",
+                    "bcns_target",
+                    _luminance_lift_params("harmonic", 1.0, projected=False, gamma_max=0.5),
+                ),
+                (
+                    "bcns_lift_poisson_s1.0",
+                    "bcns_target",
+                    _luminance_lift_params("poisson", 1.0, projected=False, gamma_max=0.5),
+                ),
+                (
+                    "bcns_lift_harmonic_s1.0_projected",
+                    "bcns_target",
+                    _luminance_lift_params("harmonic", 1.0, projected=True, gamma_max=0.5),
+                ),
+                (
+                    "bcns_lift_poisson_s1.0_projected",
+                    "bcns_target",
+                    _luminance_lift_params("poisson", 1.0, projected=True, gamma_max=0.5),
+                ),
+            ):
+                configs.append(
+                    _method_with_metadata(
+                        method_name,
+                        conditioning_name,
+                        params,
+                        sampling_steps=int(sampling_steps),
+                        ablation_sampling_steps=int(sampling_steps),
+                    )
+                )
+        return configs
+
+    if ablation_set == "lift_scale":
+        configs = []
+        for source in ("harmonic", "poisson"):
+            for projected in (False, True):
+                for lift_scale in (0.25, 0.5, 1.0, 2.0, 4.0):
+                    projected_tag = "_projected" if projected else ""
+                    configs.append(
+                        _method_with_metadata(
+                            f"bcns_lift_{source}_s{_lift_label(lift_scale)}{projected_tag}",
+                            "bcns_target",
+                            _luminance_lift_params(source, lift_scale, projected=projected, gamma_max=0.5),
+                            sampling_steps=100,
+                            ablation_lift_scale=float(lift_scale),
+                        )
+                    )
+        return configs
+
     raise ValueError(f"Unsupported ablation_set {ablation_set!r}.")
 
 
@@ -667,9 +826,11 @@ def _condition(result, default_loss):
     return result, default_loss
 
 
-def make_mask(args, mask_gen, ref_img):
+def make_mask(args, mask_gen, ref_img, seed=None):
     if args.mask_mode == "random":
-        return mask_gen(ref_img)[:, 0:1, :, :]
+        mask_known = mask_gen(ref_img)[:, 0:1, :, :]
+        unknown = (1.0 - mask_known).clamp(0, 1)
+        return mask_known, mask_metadata(unknown)
     height, width = int(ref_img.shape[-2]), int(ref_img.shape[-1])
     if args.mask_mode == "center_box":
         unknown = make_center_box_mask(
@@ -677,6 +838,22 @@ def make_mask(args, mask_gen, ref_img):
             width,
             args.box_size,
             args.box_size,
+            device=ref_img.device,
+            dtype=ref_img.dtype,
+        )
+    elif args.mask_mode == "center_box_96":
+        unknown = make_center_box_unknown_mask(
+            height,
+            width,
+            box_size=96,
+            device=ref_img.device,
+            dtype=ref_img.dtype,
+        )
+    elif args.mask_mode == "center_box_128":
+        unknown = make_center_box_unknown_mask(
+            height,
+            width,
+            box_size=128,
             device=ref_img.device,
             dtype=ref_img.dtype,
         )
@@ -688,9 +865,43 @@ def make_mask(args, mask_gen, ref_img):
             device=ref_img.device,
             dtype=ref_img.dtype,
         )
+    elif args.mask_mode == "thick_scratch_12":
+        unknown = make_thick_scratch_mask(
+            height,
+            width,
+            thickness=12,
+            device=ref_img.device,
+            dtype=ref_img.dtype,
+        )
+    elif args.mask_mode == "thick_scratch_24":
+        unknown = make_thick_scratch_mask(
+            height,
+            width,
+            thickness=24,
+            device=ref_img.device,
+            dtype=ref_img.dtype,
+        )
+    elif args.mask_mode == "text_mask":
+        unknown = make_text_like_mask(
+            height,
+            width,
+            text="TEXT",
+            thickness=12,
+            device=ref_img.device,
+            dtype=ref_img.dtype,
+        )
+    elif args.mask_mode == "freeform_medium":
+        unknown = make_freeform_medium_mask(
+            height,
+            width,
+            seed=seed,
+            device=ref_img.device,
+            dtype=ref_img.dtype,
+        )
     else:
         raise ValueError(f"Unsupported mask_mode {args.mask_mode!r}.")
-    return (1.0 - unknown).repeat(ref_img.shape[0], 1, 1, 1)
+    metadata = mask_metadata(unknown)
+    return (1.0 - unknown).repeat(ref_img.shape[0], 1, 1, 1), metadata
 
 
 def run_loop(
@@ -854,7 +1065,21 @@ def main():
     parser.add_argument("--num_images", type=int, default=8)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--record_every", type=int, default=100)
-    parser.add_argument("--mask_mode", choices=("random", "center_box", "thin_scratch"), default="thin_scratch")
+    parser.add_argument(
+        "--mask_mode",
+        choices=(
+            "random",
+            "center_box",
+            "thin_scratch",
+            "thick_scratch_12",
+            "thick_scratch_24",
+            "text_mask",
+            "freeform_medium",
+            "center_box_96",
+            "center_box_128",
+        ),
+        default="thin_scratch",
+    )
     parser.add_argument("--box_size", type=int, default=96)
     parser.add_argument("--scratch_thickness", type=int, default=5)
     parser.add_argument(
@@ -872,6 +1097,9 @@ def main():
             "guidance_strength",
             "flow_strength_extended",
             "luminance_lift",
+            "lift_candidates",
+            "lift_fewstep",
+            "lift_scale",
         ),
         default="smoke",
     )
@@ -924,7 +1152,7 @@ def main():
             image_dir.mkdir(parents=True, exist_ok=True)
         ref_img = ref_img.to(device)
         set_seed(args.seed + image_index)
-        mask = make_mask(args, mask_gen, ref_img)
+        mask, mask_info = make_mask(args, mask_gen, ref_img, seed=args.seed + image_index)
         measurement_clean = operator.forward(ref_img, mask=mask)
         measurement_noisy = noiser(measurement_clean)
         x_start_base = torch.randn(ref_img.shape, device=device)
@@ -933,7 +1161,11 @@ def main():
         for method_name, conditioning_name, params, meta in configs:
             sampling_steps = int(meta.get("sampling_steps", args.sampling_steps))
             sampler = sampler_for_steps(sampling_steps)
-            run_root = root / f"steps_{sampling_steps:04d}" if args.ablation_set == "fewstep" else root
+            run_root = (
+                root / f"steps_{sampling_steps:04d}"
+                if args.ablation_set in ("fewstep", "lift_fewstep")
+                else root
+            )
             image_dir = run_root / image_id
             image_dir.mkdir(parents=True, exist_ok=True)
             method_dir = image_dir / method_name
@@ -980,10 +1212,12 @@ def main():
             row["ablation_set"] = args.ablation_set
             row["seed"] = args.seed
             row["mask_mode"] = args.mask_mode
+            row.update(mask_info)
             row["sampling_steps"] = sampling_steps
             row["actual_num_reverse_updates"] = int(sampler.num_timesteps)
             row["final_loss"] = float(final_loss.item())
             row["sample_runtime_sec"] = float(sample_runtime_sec)
+            row.update(_method_plot_metadata(method_name, conditioning_name, params))
             row.update(meta)
             row.update(
                 evaluate_inpainting_result(
@@ -1012,9 +1246,16 @@ def main():
             )
 
     write_summary_csv(rows, root / "metrics.csv")
-    summary = summarize_by_keys(rows, ("sampling_steps", "method")) if args.ablation_set == "fewstep" else summarize_by_method(rows)
+    summary = (
+        summarize_by_keys(rows, ("sampling_steps", "method"))
+        if args.ablation_set in ("fewstep", "lift_fewstep")
+        else summarize_by_method(rows)
+    )
     write_summary_csv(summary, root / "summary_by_method.csv")
     write_summary_markdown(summary, root / "summary_by_method.md")
+    if args.ablation_set == "lift_fewstep":
+        write_summary_csv(summary, root / "summary_lift_fewstep.csv")
+        write_summary_markdown(summary, root / "summary_lift_fewstep.md")
     print(f"Wrote Step 4 ablation outputs to {root}")
 
 
