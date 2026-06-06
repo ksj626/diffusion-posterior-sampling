@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Fair comparison smoke runner for BCNS Step 2 Poisson targets."""
+"""Fair comparison smoke runner for BCNS Step 3 finite flow targets."""
 
 import argparse
 import csv
@@ -48,7 +48,27 @@ def assert_checkpoint_exists(model_config: dict) -> None:
         raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
 
 
-def _bcns_params(target_builder, poisson_method=None, rhs_mode=None):
+def _structure_params():
+    return {
+        "scale": 1.0,
+        "target_builder": "structure_prox",
+        "target_builder_params": {
+            "tau2": 1.0,
+            "lambda_structure": 0.05,
+            "structure_sigma": 1.0,
+            "prox_steps": 1,
+            "prox_step_size": 0.05,
+            "target_mode": "normalized_known_smooth",
+        },
+        "gamma_max": 0.02,
+        "tau2": 1.0,
+        "pde_start_frac": 0.7,
+        "ramp_power": 2.0,
+        "apply_noisy_known_projection": True,
+    }
+
+
+def _poisson_params(target_builder, poisson_method=None, rhs_mode=None):
     params = {
         "scale": 1.0,
         "target_builder": target_builder,
@@ -81,37 +101,62 @@ def _bcns_params(target_builder, poisson_method=None, rhs_mode=None):
     return params
 
 
-def method_configs(scale_default: float):
-    structure_projected = {
+def _flow_params(integrator, dt=1e-3, pseudo_time=3e-3):
+    return {
         "scale": 1.0,
-        "target_builder": "structure_prox",
+        "target_builder": "flow_structure",
         "target_builder_params": {
             "tau2": 1.0,
             "lambda_structure": 0.05,
             "structure_sigma": 1.0,
             "prox_steps": 1,
             "prox_step_size": 0.05,
-            "target_mode": "normalized_known_smooth",
+            "initial_mode": "projected_mu",
+            "boundary_mode": "normalized_known_smooth",
+            "boundary_vorticity_mode": "none",
+            "integrator": integrator,
+            "poisson_method": "sor_rb",
+            "poisson_max_iter": 100,
+            "poisson_tol": 1e-4,
+            "poisson_omega": 1.7,
+            "h": 1.0,
+            "dt": dt,
+            "pseudo_time": pseudo_time,
+            "nu": 0.1,
+            "kappa": 0.1,
+            "smoothing_sigma": 1.0,
+            "cfl": 0.25,
+            "check_cfl": True,
+            "vorticity_boundary_mode": "none",
         },
         "gamma_max": 0.02,
         "tau2": 1.0,
         "pde_start_frac": 0.7,
         "ramp_power": 2.0,
         "apply_noisy_known_projection": True,
+        "apply_every_n_steps": 10,
+        "reuse_last_target": False,
     }
-    return [
+
+
+def method_configs(scale_default: float, include_ftcs: bool):
+    configs = [
         ("ps", "ps", {"scale": scale_default}),
         ("projection_fixed", "projection_fixed", {}),
         ("mcg_fixed", "mcg_fixed", {"scale": scale_default}),
-        ("bcns_structure_prox_norm_projected", "bcns_target", structure_projected),
-        ("bcns_harmonic_sor_projected", "bcns_target", _bcns_params("harmonic_structure", "sor_rb")),
+        ("bcns_structure_prox_norm_projected", "bcns_target", _structure_params()),
+        ("bcns_harmonic_sor_projected", "bcns_target", _poisson_params("harmonic_structure", "sor_rb")),
         (
             "bcns_poisson_sor_projected",
             "bcns_target",
-            _bcns_params("poisson_structure", "sor_rb", "projected_mu_laplacian"),
+            _poisson_params("poisson_structure", "sor_rb", "projected_mu_laplacian"),
         ),
-        ("bcns_harmonic_cg_projected", "bcns_target", _bcns_params("harmonic_structure", "cg")),
+        ("bcns_flow_be_projected", "bcns_target", _flow_params("imex_be")),
+        ("bcns_flow_cn_projected", "bcns_target", _flow_params("imex_cn")),
     ]
+    if include_ftcs:
+        configs.append(("bcns_flow_ftcs_projected", "bcns_target", _flow_params("ftcs", 1e-4, 5e-4)))
+    return configs
 
 
 def _condition(result, x_t, default_loss):
@@ -255,6 +300,7 @@ def main():
     parser.add_argument("--mask_mode", choices=("random", "center_box", "thin_scratch"), default="center_box")
     parser.add_argument("--box_size", type=int, default=96)
     parser.add_argument("--scratch_thickness", type=int, default=5)
+    parser.add_argument("--include_ftcs", action="store_true")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -282,7 +328,7 @@ def main():
     rows = []
     base_params = task_config.get("conditioning", {}).get("params", {})
     scale_default = float(base_params.get("scale", 1.0))
-    configs = method_configs(scale_default)
+    configs = method_configs(scale_default, include_ftcs=args.include_ftcs)
     diagnostic_fields = [
         "poisson_num_iter",
         "poisson_converged",
@@ -292,6 +338,14 @@ def main():
         "prox_final_loss",
         "rhs_mode",
         "poisson_method",
+        "flow_integrator",
+        "flow_num_steps",
+        "flow_runtime_sec",
+        "flow_final_poisson_residual",
+        "flow_final_rhs_norm",
+        "flow_has_nan",
+        "boundary_vorticity_mode",
+        "vorticity_boundary_mode",
         "target_recomputed",
         "target_reused",
         "apply_every_n_steps",
@@ -393,7 +447,7 @@ def main():
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    print(f"Wrote Step 2 comparison smoke outputs to {root}")
+    print(f"Wrote Step 3 comparison smoke outputs to {root}")
 
 
 if __name__ == "__main__":

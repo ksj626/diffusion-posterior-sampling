@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from .dps_adapter import hard_project_clean, hole_from_known, validate_image_tensor, validate_mask_tensor
+from .flow_targets import build_flow_structure_target
 from .poisson_targets import build_poisson_structure_target
 from .proximal import structure_proximal_target, structure_proximal_target_from_structure
 
@@ -181,6 +182,108 @@ class PoissonStructureTargetBuilder:
         return TargetBuildResult(target=prox_result.target, diagnostics=diagnostics)
 
 
+class FlowStructureTargetBuilder:
+    """Finite BCNS vorticity-stream flow target followed by RGB proximal target."""
+
+    def __init__(
+        self,
+        tau2: float = 1.0,
+        lambda_structure: float = 0.05,
+        structure_sigma: float = 1.0,
+        prox_steps: int = 1,
+        prox_step_size: float = 0.05,
+        initial_mode: str = "projected_mu",
+        boundary_mode: str = "normalized_known_smooth",
+        boundary_vorticity_mode: str = "none",
+        integrator: str = "imex_be",
+        poisson_method: str = "sor_rb",
+        poisson_max_iter: int = 100,
+        poisson_tol: float = 1e-4,
+        poisson_omega: float = 1.7,
+        h: float = 1.0,
+        dt: float = 1e-3,
+        pseudo_time: float = 3e-3,
+        nu: float = 0.1,
+        kappa: float = 0.1,
+        smoothing_sigma: float = 1.0,
+        cfl: float = 0.25,
+        check_cfl: bool = True,
+        vorticity_boundary_mode: str = "none",
+    ):
+        self.tau2 = tau2
+        self.lambda_structure = lambda_structure
+        self.structure_sigma = structure_sigma
+        self.prox_steps = prox_steps
+        self.prox_step_size = prox_step_size
+        self.initial_mode = initial_mode
+        self.boundary_mode = boundary_mode
+        self.boundary_vorticity_mode = boundary_vorticity_mode
+        self.integrator = integrator
+        self.poisson_method = poisson_method
+        self.poisson_max_iter = poisson_max_iter
+        self.poisson_tol = poisson_tol
+        self.poisson_omega = poisson_omega
+        self.h = h
+        self.dt = dt
+        self.pseudo_time = pseudo_time
+        self.nu = nu
+        self.kappa = kappa
+        self.smoothing_sigma = smoothing_sigma
+        self.cfl = cfl
+        self.check_cfl = check_cfl
+        self.vorticity_boundary_mode = vorticity_boundary_mode
+
+    def __call__(self, mu, measurement, mask_known, **kwargs) -> TargetBuildResult:
+        tau2 = kwargs.get("tau2", self.tau2)
+        flow_result = build_flow_structure_target(
+            mu=mu,
+            measurement=measurement,
+            mask_known=mask_known,
+            structure_sigma=self.structure_sigma,
+            initial_mode=self.initial_mode,
+            boundary_mode=self.boundary_mode,
+            boundary_vorticity_mode=self.boundary_vorticity_mode,
+            integrator=self.integrator,
+            poisson_method=self.poisson_method,
+            poisson_max_iter=self.poisson_max_iter,
+            poisson_tol=self.poisson_tol,
+            poisson_omega=self.poisson_omega,
+            h=self.h,
+            dt=self.dt,
+            pseudo_time=self.pseudo_time,
+            nu=self.nu,
+            kappa=self.kappa,
+            smoothing_sigma=self.smoothing_sigma,
+            cfl=self.cfl,
+            check_cfl=self.check_cfl,
+            vorticity_boundary_mode=self.vorticity_boundary_mode,
+        )
+        prox_result = structure_proximal_target_from_structure(
+            mu=mu,
+            measurement=measurement,
+            mask_known=mask_known,
+            target_structure=flow_result.structure.to(dtype=mu.dtype, device=mu.device),
+            tau2=tau2,
+            lambda_structure=self.lambda_structure,
+            structure_sigma=self.structure_sigma,
+            prox_steps=self.prox_steps,
+            prox_step_size=self.prox_step_size,
+        )
+        diagnostics = {
+            "target_builder": "flow_structure",
+            "lambda_structure": self.lambda_structure,
+            "structure_sigma": self.structure_sigma,
+            "prox_steps": self.prox_steps,
+            "prox_step_size": self.prox_step_size,
+            "prox_final_loss": prox_result.diagnostics["prox_final_loss"],
+            "target_disp": prox_result.diagnostics["target_disp"],
+            "flow_structure_disp": flow_result.diagnostics.get("flow_structure_disp"),
+        }
+        diagnostics.update(flow_result.diagnostics)
+        diagnostics["target_disp"] = prox_result.diagnostics["target_disp"]
+        return TargetBuildResult(target=prox_result.target, diagnostics=diagnostics)
+
+
 def get_target_builder(name: str, **kwargs):
     """Return a target builder by name."""
 
@@ -189,6 +292,7 @@ def get_target_builder(name: str, **kwargs):
         "hard_projection": HardProjectionTargetBuilder,
         "simple_hole_shift": SimpleHoleShiftTargetBuilder,
         "structure_prox": StructureProxTargetBuilder,
+        "flow_structure": FlowStructureTargetBuilder,
     }
     if name == "harmonic_structure":
         return PoissonStructureTargetBuilder(target_builder="harmonic_structure", **kwargs)

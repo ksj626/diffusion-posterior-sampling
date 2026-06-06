@@ -147,7 +147,7 @@ class PosteriorSamplingPlus(ConditioningMethod):
 
 @register_conditioning_method(name="bcns_target")
 class BCNSTargetGuidance(ConditioningMethod):
-    """Minimal BCNS target-guidance skeleton for inpainting debug modes."""
+    """BCNS target-guidance conditioning for inpainting debug and PDE targets."""
 
     def __init__(self, operator, noiser, **kwargs):
         super().__init__(operator, noiser)
@@ -162,8 +162,12 @@ class BCNSTargetGuidance(ConditioningMethod):
             ramp_power=kwargs.get("ramp_power", 2.0),
         )
         self.apply_noisy_known_projection = kwargs.get("apply_noisy_known_projection", False)
+        self.apply_every_n_steps = int(kwargs.get("apply_every_n_steps", 1))
+        self.reuse_last_target = kwargs.get("reuse_last_target", False)
         self.debug = kwargs.get("debug", False)
         self.last_diagnostics = {}
+        self._last_target = None
+        self._last_target_diagnostics = {}
 
     def _gamma_and_tau2(self, x_t, **kwargs):
         t_index = kwargs.get("t_index", kwargs.get("idx", None))
@@ -174,12 +178,51 @@ class BCNSTargetGuidance(ConditioningMethod):
         tau2 = self.schedule.tau2_value(int(t_index), int(num_steps))
         return gamma, tau2
 
+    def _selected_for_target(self, t_index):
+        if t_index is None or self.apply_every_n_steps <= 1:
+            return True
+        return int(t_index) % self.apply_every_n_steps == 0
+
     def _project_if_requested(self, x_t, noisy_measurement, mask):
         if not self.apply_noisy_known_projection:
             return x_t
         if noisy_measurement is None:
             raise ValueError("apply_noisy_known_projection=True requires noisy_measurement.")
         return project_known_noisy(x_t, noisy_measurement, mask)
+
+    def _zero_return(
+        self,
+        x_t,
+        noisy_measurement,
+        mask,
+        t_index,
+        gamma,
+        tau2,
+        target_recomputed=False,
+        target_reused=False,
+    ):
+        x_t = self._project_if_requested(x_t, noisy_measurement, mask)
+        zero = torch.zeros((), device=x_t.device, dtype=x_t.dtype)
+        self.last_diagnostics = {
+            "t_index": t_index,
+            "gamma": gamma,
+            "tau2": tau2,
+            "loss": 0.0,
+            "grad_norm": 0.0,
+            "target_disp": 0.0,
+            "apply_noisy_known_projection": self.apply_noisy_known_projection,
+            "target_recomputed": bool(target_recomputed),
+            "target_reused": bool(target_reused),
+            "apply_every_n_steps": self.apply_every_n_steps,
+        }
+        if self.debug:
+            print(
+                f"[BCNS] t={t_index} gamma={gamma:.6g} tau2={tau2:.6g} "
+                f"loss=0 grad=0 target_disp=0 "
+                f"recomputed={target_recomputed} reused={target_reused} "
+                f"every={self.apply_every_n_steps} project={self.apply_noisy_known_projection}"
+            )
+        return x_t, zero
 
     def conditioning(
         self,
@@ -196,33 +239,50 @@ class BCNSTargetGuidance(ConditioningMethod):
 
         gamma, tau2 = self._gamma_and_tau2(x_t, **kwargs)
         t_index = kwargs.get("t_index", kwargs.get("idx", None))
+        selected = self._selected_for_target(t_index)
         if gamma == 0:
-            x_t = self._project_if_requested(x_t, noisy_measurement, mask)
-            zero = torch.zeros((), device=x_t.device, dtype=x_t.dtype)
-            self.last_diagnostics = {
-                "t_index": t_index,
-                "gamma": gamma,
-                "tau2": tau2,
-                "loss": 0.0,
-                "grad_norm": 0.0,
-                "target_disp": 0.0,
-                "apply_noisy_known_projection": self.apply_noisy_known_projection,
-            }
-            if self.debug:
-                print(
-                    f"[BCNS] t={t_index} gamma={gamma:.6g} tau2={tau2:.6g} "
-                    f"loss=0 grad=0 target_disp=0 "
-                    f"project={self.apply_noisy_known_projection}"
-                )
-            return x_t, zero
+            return self._zero_return(
+                x_t,
+                noisy_measurement,
+                mask,
+                t_index,
+                gamma,
+                tau2,
+                target_recomputed=False,
+                target_reused=False,
+            )
 
-        result = self.target_builder(
-            mu=x_0_hat,
-            measurement=measurement,
-            mask_known=mask,
-            tau2=tau2,
-        )
-        target = result.target.detach()
+        target_recomputed = False
+        target_reused = False
+        result_diagnostics = {}
+        if selected:
+            result = self.target_builder(
+                mu=x_0_hat,
+                measurement=measurement,
+                mask_known=mask,
+                tau2=tau2,
+            )
+            target = result.target.detach()
+            result_diagnostics = dict(result.diagnostics)
+            self._last_target = target
+            self._last_target_diagnostics = dict(result_diagnostics)
+            target_recomputed = True
+        elif self.reuse_last_target and self._last_target is not None:
+            target = self._last_target.detach()
+            result_diagnostics = dict(self._last_target_diagnostics)
+            target_reused = True
+        else:
+            return self._zero_return(
+                x_t,
+                noisy_measurement,
+                mask,
+                t_index,
+                gamma,
+                tau2,
+                target_recomputed=False,
+                target_reused=False,
+            )
+
         target_disp = torch.linalg.norm((target - x_0_hat).reshape(-1))
         loss = target_discrepancy_loss(
             mu=x_0_hat,
@@ -242,14 +302,18 @@ class BCNSTargetGuidance(ConditioningMethod):
             "grad_norm": float(grad_norm.detach().item()),
             "target_disp": float(target_disp.detach().item()),
         }
-        self.last_diagnostics.update(result.diagnostics)
+        self.last_diagnostics.update(result_diagnostics)
         self.last_diagnostics["apply_noisy_known_projection"] = self.apply_noisy_known_projection
+        self.last_diagnostics["target_recomputed"] = bool(target_recomputed)
+        self.last_diagnostics["target_reused"] = bool(target_reused)
+        self.last_diagnostics["apply_every_n_steps"] = self.apply_every_n_steps
         if self.debug:
             print(
                 f"[BCNS] t={t_index} gamma={gamma:.6g} tau2={tau2:.6g} "
                 f"loss={self.last_diagnostics['loss']:.6g} "
                 f"grad={self.last_diagnostics['grad_norm']:.6g} "
                 f"target_disp={self.last_diagnostics['target_disp']:.6g} "
-                f"project={self.apply_noisy_known_projection}"
+                f"recomputed={target_recomputed} reused={target_reused} "
+                f"every={self.apply_every_n_steps} project={self.apply_noisy_known_projection}"
             )
         return x_t, loss.detach()
