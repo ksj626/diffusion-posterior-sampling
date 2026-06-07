@@ -1,6 +1,8 @@
 from scripts.bcns.run_bcns_step4_ablation import (
     ALLOWED_SAMPLING_STEPS,
+    dataset_index_for_sample,
     method_configs,
+    should_visualize_sample,
     validate_sampling_steps,
 )
 
@@ -87,3 +89,10 @@ def test_frequency_ablation_set_names():
         "mcg_bcns_harmonic_best",
         "mcg_bcns_harmonic_freq_best",
     ]
+
+
+def test_dataset_cycling_and_visualization_cap_helpers():
+    assert [dataset_index_for_sample(i, 3) for i in range(8)] == [0, 1, 2, 0, 1, 2, 0, 1]
+    assert should_visualize_sample(9, 10) is True
+    assert should_visualize_sample(10, 10) is False
+    assert should_visualize_sample(63, -1) is True

@@ -73,6 +73,22 @@ MAIN_RESULT_MASKS = (
 )
 
 
+def dataset_index_for_sample(image_index: int, dataset_size: int) -> int:
+    """Return the source dataset index used for a possibly cycled trial."""
+
+    if dataset_size <= 0:
+        raise ValueError("dataset_size must be positive.")
+    return int(image_index) % int(dataset_size)
+
+
+def should_visualize_sample(image_index: int, num_visualize: int) -> bool:
+    """Return whether this trial should get PNG/contact-sheet artifacts."""
+
+    if int(num_visualize) < 0:
+        return True
+    return int(image_index) < int(num_visualize)
+
+
 def load_yaml(path: str) -> dict:
     with open(path) as handle:
         return yaml.load(handle, Loader=yaml.FullLoader)
@@ -1649,7 +1665,7 @@ def run_loop(
         img, last_loss = _condition(conditioned, last_loss)
         img = img.detach_()
         pbar.set_postfix({"loss": float(last_loss.item())}, refresh=False)
-        if record_every > 0 and int(idx) % record_every == 0:
+        if progress_dir is not None and record_every > 0 and int(idx) % record_every == 0:
             save_tensor_image(img, progress_dir / f"x_{str(int(idx)).zfill(4)}.png")
     return img, last_loss
 
@@ -1776,6 +1792,12 @@ def main():
     parser.add_argument("--save_dir", required=True)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--num_images", type=int, default=8)
+    parser.add_argument(
+        "--num_visualize",
+        type=int,
+        default=10,
+        help="Save visual artifacts for the first N trials only; set negative to save all.",
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--record_every", type=int, default=100)
     parser.add_argument(
@@ -1839,6 +1861,8 @@ def main():
     parser.add_argument("--structural_sigma", type=float, default=1.0)
     parser.add_argument("--boundary_width", type=int, default=3)
     args = parser.parse_args()
+    if args.num_images <= 0:
+        raise ValueError("--num_images must be positive.")
 
     set_seed(args.seed)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
@@ -1864,6 +1888,10 @@ def main():
     )
     dataset = get_dataset(**task_config["data"], transforms=transform)
     loader = get_dataloader(dataset, batch_size=1, num_workers=0, train=False)
+    print(
+        f"Dataset has {len(dataset)} source image(s); running {args.num_images} trial(s) "
+        f"and saving visual artifacts for {args.num_visualize if args.num_visualize >= 0 else 'all'} trial(s)."
+    )
     mask_gen = mask_generator(**task_config["measurement"]["mask_opt"])
 
     root = Path(args.save_dir)
@@ -1874,11 +1902,19 @@ def main():
     configs = method_configs(args.ablation_set, scale_default, full_strength_grid=args.full_strength_grid)
     write_config_used(root / "config_used.yaml", args, model_config, diffusion_config, task_config, configs)
 
-    for image_index, ref_img in enumerate(loader):
-        if image_index >= args.num_images:
-            break
+    dataset_size = len(dataset)
+    data_iter = iter(loader)
+    for image_index in range(args.num_images):
+        try:
+            ref_img = next(data_iter)
+        except StopIteration:
+            data_iter = iter(loader)
+            ref_img = next(data_iter)
+        source_dataset_index = dataset_index_for_sample(image_index, dataset_size)
+        dataset_cycle = image_index // dataset_size
+        save_visuals = should_visualize_sample(image_index, args.num_visualize)
         image_id = str(image_index).zfill(5)
-        if args.ablation_set != "fewstep":
+        if save_visuals and args.ablation_set != "fewstep":
             image_dir = root / image_id
             image_dir.mkdir(parents=True, exist_ok=True)
         ref_img = ref_img.to(device)
@@ -1901,11 +1937,15 @@ def main():
                 if args.ablation_set in ("fewstep", "lift_fewstep")
                 else root
             )
-            image_dir = run_root / image_id
-            image_dir.mkdir(parents=True, exist_ok=True)
-            method_dir = image_dir / method_name
-            progress_dir = method_dir / "progress"
-            progress_dir.mkdir(parents=True, exist_ok=True)
+            if save_visuals:
+                image_dir = run_root / image_id
+                image_dir.mkdir(parents=True, exist_ok=True)
+                method_dir = image_dir / method_name
+                progress_dir = method_dir / "progress"
+                progress_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                method_dir = None
+                progress_dir = None
             cond_method = get_conditioning_method(conditioning_name, operator, noiser, **params)
             if hasattr(cond_method, "reset_trace"):
                 cond_method.reset_trace()
@@ -1926,22 +1966,28 @@ def main():
             )
             sample_runtime_sec = time.time() - start_time
             diagnostics = dict(getattr(cond_method, "last_diagnostics", {}) or {})
-            if hasattr(cond_method, "get_trace"):
+            if save_visuals and hasattr(cond_method, "get_trace"):
                 write_guidance_trace(method_dir, cond_method.get_trace())
             if hasattr(cond_method, "summarize_trace"):
                 diagnostics.update(cond_method.summarize_trace())
-            write_method_diagnostics(method_dir, diagnostics)
             recon_composite = clean_composite(recon_raw, measurement_clean, mask)
-            ordered, labels = write_method_outputs(
-                method_dir, measurement_noisy, mask, ref_img, recon_raw, recon_composite
-            )
-            group_key = (run_root, image_id)
-            comparison_groups[group_key]["paths"].extend(ordered)
-            comparison_groups[group_key]["labels"].extend([f"{method_name} {label}" for label in labels])
+            if save_visuals:
+                write_method_diagnostics(method_dir, diagnostics)
+                ordered, labels = write_method_outputs(
+                    method_dir, measurement_noisy, mask, ref_img, recon_raw, recon_composite
+                )
+                group_key = (run_root, image_id)
+                comparison_groups[group_key]["paths"].extend(ordered)
+                comparison_groups[group_key]["labels"].extend([f"{method_name} {label}" for label in labels])
 
             row = OrderedDict()
             row["image_index"] = image_index
             row["image_id"] = image_id
+            row["source_dataset_index"] = int(source_dataset_index)
+            row["dataset_cycle"] = int(dataset_cycle)
+            row["dataset_size"] = int(dataset_size)
+            row["visualized"] = bool(save_visuals)
+            row["num_visualize"] = int(args.num_visualize)
             row["method"] = method_name
             row["conditioning_method"] = conditioning_name
             row["ablation_set"] = args.ablation_set

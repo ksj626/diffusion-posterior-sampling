@@ -8,6 +8,7 @@ MODEL_CONFIG="configs/model_config.yaml"
 DIFFUSION_CONFIG="configs/diffusion_config.yaml"
 TASK_CONFIG="configs/inpainting_bcns_flow_be_struct_projected_ffhq.yaml"
 NUM_IMAGES="64"
+NUM_VISUALIZE="10"
 SEED="6000"
 RECORD_EVERY="50"
 DRY_RUN=0
@@ -24,6 +25,7 @@ Options:
   --diffusion_config PATH
   --task_config PATH
   --num_images N
+  --num_visualize N
   --seed N
   --record_every N
   --dry_run
@@ -39,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --diffusion_config) DIFFUSION_CONFIG="$2"; shift 2 ;;
     --task_config) TASK_CONFIG="$2"; shift 2 ;;
     --num_images) NUM_IMAGES="$2"; shift 2 ;;
+    --num_visualize) NUM_VISUALIZE="$2"; shift 2 ;;
     --seed) SEED="$2"; shift 2 ;;
     --record_every) RECORD_EVERY="$2"; shift 2 ;;
     --dry_run) DRY_RUN=1; shift ;;
@@ -86,6 +89,7 @@ launch_job() {
     --task_config "$TASK_CONFIG"
     --gpu 0
     --num_images "$NUM_IMAGES"
+    --num_visualize "$NUM_VISUALIZE"
     --seed "$SEED"
     --record_every "$RECORD_EVERY"
     "$@"
