@@ -5,3 +5,4 @@ results/bcns_step1/
 results/*
 */*.pt
 bkse/
+data/samples/*

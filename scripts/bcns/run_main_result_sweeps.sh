@@ -115,7 +115,7 @@ run_main() {
     center_keep_128
     global_random_50_60
   )
-  local steps=(20 50 100 250)
+  local steps=(20 50 100)
   local mask step
   for mask in "${masks[@]}"; do
     for step in "${steps[@]}"; do
