@@ -300,6 +300,86 @@ def _luminance_lift_params(
     return params
 
 
+def _mcg_bcns_lift_params(
+    source: str,
+    lift_scale: float,
+    projected: bool = True,
+    bcns_gamma_max: float = 0.5,
+    mcg_scale: float = 0.3,
+    bcns_scale: float = 1.0,
+    apply_every_n_steps: int = 5,
+    mode: str = "equal_rgb",
+    pseudo_time: float = None,
+    dt: float = None,
+    nu: float = None,
+):
+    builder_params = {
+        "lift_scale": float(lift_scale),
+        "mode": mode,
+        "structure_sigma": 1.0,
+    }
+    if source == "harmonic":
+        target_builder = "luminance_lift_harmonic"
+        builder_params.update(
+            {
+                "rhs_mode": "zero",
+                "poisson_method": "sor_rb",
+                "poisson_max_iter": 100,
+                "poisson_tol": 1e-4,
+            }
+        )
+    elif source == "poisson":
+        target_builder = "luminance_lift_poisson"
+        builder_params.update(
+            {
+                "rhs_mode": "projected_mu_laplacian",
+                "poisson_method": "sor_rb",
+                "poisson_max_iter": 100,
+                "poisson_tol": 1e-4,
+            }
+        )
+    elif source == "flow":
+        target_builder = "luminance_lift_flow"
+        builder_params.update(
+            {
+                "initial_mode": "projected_mu",
+                "boundary_mode": "normalized_known_smooth",
+                "boundary_vorticity_mode": "none",
+                "integrator": "imex_be",
+                "poisson_method": "sor_rb",
+                "poisson_max_iter": 100,
+                "poisson_tol": 1e-4,
+                "poisson_omega": 1.7,
+                "h": 1.0,
+                "dt": 0.001 if dt is None else float(dt),
+                "pseudo_time": 0.003 if pseudo_time is None else float(pseudo_time),
+                "nu": 0.1 if nu is None else float(nu),
+                "kappa": 0.1,
+                "smoothing_sigma": 1.0,
+                "cfl": 0.25,
+                "check_cfl": True,
+                "vorticity_boundary_mode": "none",
+            }
+        )
+    else:
+        raise ValueError("source must be one of 'flow', 'poisson', or 'harmonic'.")
+
+    return {
+        "mcg_scale": float(mcg_scale),
+        "bcns_scale": float(bcns_scale),
+        "bcns_gamma_max": float(bcns_gamma_max),
+        "bcns_tau2": 1.0,
+        "bcns_pde_start_frac": 0.5,
+        "bcns_ramp_power": 2.0,
+        "bcns_apply_every_n_steps": int(apply_every_n_steps),
+        "bcns_reuse_last_target": False,
+        "bcns_target_builder": target_builder,
+        "bcns_target_builder_params": builder_params,
+        "apply_noisy_known_projection": bool(projected),
+        "debug": False,
+    }
+
+
 def _method(method, conditioning, params, **meta):
     return (method, conditioning, params, meta)
 
@@ -307,12 +387,17 @@ def _method(method, conditioning, params, **meta):
 def _method_plot_metadata(method_name: str, conditioning_name: str, params: dict) -> dict:
     target_builder = params.get("target_builder", "")
     target_params = params.get("target_builder_params", {}) if isinstance(params, dict) else {}
+    if conditioning_name == "mcg_bcns":
+        target_builder = params.get("bcns_target_builder", "")
+        target_params = params.get("bcns_target_builder_params", {}) if isinstance(params, dict) else {}
     if conditioning_name == "ps":
         family = "ps"
     elif conditioning_name == "projection_fixed":
         family = "projection"
     elif conditioning_name == "mcg_fixed":
         family = "mcg"
+    elif conditioning_name == "mcg_bcns":
+        family = "mcg_bcns"
     elif target_builder.startswith("luminance_lift"):
         family = "bcns_lift"
     elif target_builder == "flow_structure":
@@ -337,7 +422,7 @@ def _method_plot_metadata(method_name: str, conditioning_name: str, params: dict
 
     if target_builder.startswith("luminance_lift"):
         transfer = "luminance_lift"
-    elif conditioning_name != "bcns_target":
+    elif conditioning_name not in ("bcns_target", "mcg_bcns"):
         transfer = "none"
     elif float(params.get("structure_loss_weight", 0.0)) > 0.0 and float(params.get("rgb_loss_weight", 1.0)) == 0.0:
         transfer = "structure_loss"
@@ -357,6 +442,50 @@ def _method_with_metadata(method, conditioning, params, **meta):
     merged = _method_plot_metadata(method, conditioning, params)
     merged.update(meta)
     return _method(method, conditioning, params, **merged)
+
+
+def _mcg_bcns_with_metadata(
+    method,
+    source,
+    lift_scale,
+    projected=True,
+    bcns_gamma_max=0.5,
+    mcg_scale=0.3,
+    bcns_scale=1.0,
+    apply_every_n_steps=5,
+    mode="equal_rgb",
+    pseudo_time=None,
+    dt=None,
+    nu=None,
+    **meta,
+):
+    params = _mcg_bcns_lift_params(
+        source=source,
+        lift_scale=lift_scale,
+        projected=projected,
+        bcns_gamma_max=bcns_gamma_max,
+        mcg_scale=mcg_scale,
+        bcns_scale=bcns_scale,
+        apply_every_n_steps=apply_every_n_steps,
+        mode=mode,
+        pseudo_time=pseudo_time,
+        dt=dt,
+        nu=nu,
+    )
+    builder_params = params["bcns_target_builder_params"]
+    merged = {
+        "mcg_scale": float(params["mcg_scale"]),
+        "bcns_gamma_max": float(params["bcns_gamma_max"]),
+        "bcns_apply_every_n_steps": int(params["bcns_apply_every_n_steps"]),
+        "bcns_target_builder": params["bcns_target_builder"],
+        "lift_scale": float(builder_params["lift_scale"]),
+        "pde_source": source,
+        "flow_pseudo_time": builder_params.get("pseudo_time", ""),
+        "flow_dt": builder_params.get("dt", ""),
+        "flow_nu": builder_params.get("nu", ""),
+    }
+    merged.update(meta)
+    return _method_with_metadata(method, "mcg_bcns", params, **merged)
 
 
 def _lift_candidate_configs(scale_default: float):
@@ -817,6 +946,113 @@ def method_configs(ablation_set: str, scale_default: float, full_strength_grid: 
                     )
         return configs
 
+    if ablation_set == "mcg_bcns_main":
+        return [
+            _method_with_metadata("ps", "ps", {"scale": scale_default}),
+            _method_with_metadata("projection_fixed", "projection_fixed", {}),
+            _method_with_metadata("mcg_fixed", "mcg_fixed", {"scale": scale_default}),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_lift_harmonic",
+                "harmonic",
+                1.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+            ),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_lift_poisson",
+                "poisson",
+                2.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+            ),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_lift_flow_strong",
+                "flow",
+                4.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+                pseudo_time=0.03,
+                dt=0.001,
+                nu=0.2,
+            ),
+        ]
+
+    if ablation_set == "mcg_bcns_pde_strength":
+        configs = [_method_with_metadata("mcg_fixed", "mcg_fixed", {"scale": scale_default})]
+        for lift_scale in (1.0, 2.0, 4.0, 8.0):
+            configs.append(
+                _mcg_bcns_with_metadata(
+                    f"mcg_bcns_poisson_lift_s{int(lift_scale)}",
+                    "poisson",
+                    lift_scale,
+                    projected=True,
+                    bcns_gamma_max=0.5,
+                )
+            )
+        for lift_scale in (1.0, 2.0, 4.0):
+            configs.append(
+                _mcg_bcns_with_metadata(
+                    f"mcg_bcns_harmonic_lift_s{int(lift_scale)}",
+                    "harmonic",
+                    lift_scale,
+                    projected=True,
+                    bcns_gamma_max=0.5,
+                )
+            )
+        flow_settings = [
+            ("mcg_bcns_flow_weak", 0.003, 0.001, 0.1, 1.0, 0.3),
+            ("mcg_bcns_flow_mid", 0.01, 0.001, 0.1, 2.0, 0.5),
+            ("mcg_bcns_flow_strong", 0.03, 0.001, 0.2, 4.0, 0.5),
+            ("mcg_bcns_flow_very_strong", 0.1, 0.001, 0.2, 8.0, 1.0),
+        ]
+        for name, pseudo_time, dt, nu, lift_scale, gamma in flow_settings:
+            configs.append(
+                _mcg_bcns_with_metadata(
+                    name,
+                    "flow",
+                    lift_scale,
+                    projected=True,
+                    bcns_gamma_max=gamma,
+                    pseudo_time=pseudo_time,
+                    dt=dt,
+                    nu=nu,
+                )
+            )
+        return configs
+
+    if ablation_set == "mcg_bcns_projection_effect":
+        return [
+            _method_with_metadata("mcg_fixed", "mcg_fixed", {"scale": scale_default}),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_lift_poisson",
+                "poisson",
+                2.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+            ),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_lift_poisson_unprojected",
+                "poisson",
+                2.0,
+                projected=False,
+                bcns_gamma_max=0.5,
+            ),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_lift_harmonic",
+                "harmonic",
+                1.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+            ),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_lift_harmonic_unprojected",
+                "harmonic",
+                1.0,
+                projected=False,
+                bcns_gamma_max=0.5,
+            ),
+        ]
+
     raise ValueError(f"Unsupported ablation_set {ablation_set!r}.")
 
 
@@ -1100,6 +1336,9 @@ def main():
             "lift_candidates",
             "lift_fewstep",
             "lift_scale",
+            "mcg_bcns_main",
+            "mcg_bcns_pde_strength",
+            "mcg_bcns_projection_effect",
         ),
         default="smoke",
     )

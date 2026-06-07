@@ -117,6 +117,307 @@ class FixedManifoldConstraintGradient(ManifoldConstraintGradient):
         x_t = x_t - norm_grad * self.scale
         x_t = project_known_noisy(x_t, noisy_measurement, mask)
         return x_t, norm
+
+
+@register_conditioning_method(name="mcg_bcns")
+class MCGBCNSGuidance(ConditioningMethod):
+    """Combined MCG measurement guidance plus BCNS structural target guidance."""
+
+    def __init__(self, operator, noiser, **kwargs):
+        super().__init__(operator, noiser)
+        self.mcg_scale = float(kwargs.get("mcg_scale", 0.3))
+        self.bcns_scale = float(kwargs.get("bcns_scale", 1.0))
+        self.bcns_schedule = schedule_from_kwargs(
+            gamma_max=kwargs.get("bcns_gamma_max", 0.5),
+            tau2=kwargs.get("bcns_tau2", 1.0),
+            pde_start_frac=kwargs.get("bcns_pde_start_frac", 0.5),
+            ramp_power=kwargs.get("bcns_ramp_power", 2.0),
+        )
+        self.bcns_apply_every_n_steps = int(kwargs.get("bcns_apply_every_n_steps", 5))
+        self.bcns_reuse_last_target = bool(kwargs.get("bcns_reuse_last_target", False))
+        target_builder = kwargs.get("bcns_target_builder", "luminance_lift_poisson")
+        target_builder_params = kwargs.get("bcns_target_builder_params", None) or {}
+        self.bcns_target_builder_name = target_builder
+        self.bcns_target_builder_params = dict(target_builder_params)
+        self.bcns_target_builder = get_target_builder(target_builder, **target_builder_params)
+        self.apply_noisy_known_projection = bool(kwargs.get("apply_noisy_known_projection", True))
+        self.debug = bool(kwargs.get("debug", False))
+        self.last_diagnostics = {}
+        self.trace = []
+        self._last_target = None
+        self._last_target_diagnostics = {}
+
+    def reset_trace(self):
+        self.trace = []
+
+    def get_trace(self):
+        return list(self.trace)
+
+    @staticmethod
+    def _mean(values):
+        return sum(values) / float(len(values)) if values else 0.0
+
+    @staticmethod
+    def _trace_number(value):
+        if torch.is_tensor(value):
+            value = value.detach().item()
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, int):
+            return int(value)
+        return float(value)
+
+    def summarize_trace(self):
+        rows = self.get_trace()
+        meas_grad_norms = [float(row.get("meas_grad_norm", 0.0)) for row in rows]
+        bcns_grad_norms = [float(row.get("bcns_grad_norm", 0.0)) for row in rows]
+        meas_update_norms = [float(row.get("meas_update_norm", 0.0)) for row in rows]
+        bcns_update_norms = [float(row.get("bcns_update_norm", 0.0)) for row in rows]
+        update_ratios = [float(row.get("bcns_to_meas_update_ratio", 0.0)) for row in rows]
+        return {
+            "mean_meas_grad_norm": self._mean(meas_grad_norms),
+            "mean_bcns_grad_norm": self._mean(bcns_grad_norms),
+            "max_bcns_grad_norm": max(bcns_grad_norms) if bcns_grad_norms else 0.0,
+            "sum_meas_update_norm": sum(meas_update_norms),
+            "sum_bcns_update_norm": sum(bcns_update_norms),
+            "max_bcns_to_meas_update_ratio": max(update_ratios) if update_ratios else 0.0,
+            "mean_bcns_to_meas_update_ratio": self._mean(update_ratios),
+            "num_bcns_nonzero_steps": sum(1 for value in bcns_grad_norms if value > 0.0),
+            "num_bcns_target_recomputed": sum(
+                1 for row in rows if bool(row.get("bcns_target_recomputed", False))
+            ),
+            "num_bcns_target_reused": sum(
+                1 for row in rows if bool(row.get("bcns_target_reused", False))
+            ),
+        }
+
+    def _append_trace(self, diagnostics):
+        keys = [
+            "t_index",
+            "num_steps",
+            "meas_loss",
+            "bcns_loss",
+            "total_loss",
+            "meas_grad_norm",
+            "bcns_grad_norm",
+            "meas_update_norm",
+            "bcns_update_norm",
+            "bcns_to_meas_grad_ratio",
+            "bcns_to_meas_update_ratio",
+            "bcns_gamma",
+            "bcns_target_recomputed",
+            "bcns_target_reused",
+            "bcns_target_skipped",
+            "target_disp_hole",
+            "target_disp_known",
+            "target_disp_full",
+            "apply_noisy_known_projection",
+        ]
+        self.trace.append({key: self._trace_number(diagnostics.get(key, 0.0)) for key in keys})
+
+    def _gamma_and_tau2(self, **kwargs):
+        t_index = kwargs.get("t_index", kwargs.get("idx", None))
+        num_steps = kwargs.get("num_steps", None)
+        if t_index is None or num_steps is None:
+            return self.bcns_schedule.gamma_max, self.bcns_schedule.tau2
+        gamma = self.bcns_schedule.gamma(int(t_index), int(num_steps))
+        tau2 = self.bcns_schedule.tau2_value(int(t_index), int(num_steps))
+        return gamma, tau2
+
+    def _selected_for_bcns(self, t_index):
+        if t_index is None or self.bcns_apply_every_n_steps <= 1:
+            return True
+        return int(t_index) % self.bcns_apply_every_n_steps == 0
+
+    def _project_if_requested(self, x_t, noisy_measurement, mask):
+        if not self.apply_noisy_known_projection:
+            return x_t
+        if noisy_measurement is None:
+            raise ValueError("apply_noisy_known_projection=True requires noisy_measurement.")
+        return project_known_noisy(x_t, noisy_measurement, mask)
+
+    def _measurement_loss(self, x_0_hat, measurement, **kwargs):
+        if self.noiser.__name__ in ("gaussian", "clean"):
+            difference = measurement - self.operator.forward(x_0_hat, **kwargs)
+            loss = torch.linalg.norm(difference)
+        elif self.noiser.__name__ == "poisson":
+            ax = self.operator.forward(x_0_hat, **kwargs)
+            difference = measurement - ax
+            loss = torch.linalg.norm(difference) / measurement.abs()
+            loss = loss.mean()
+        else:
+            raise NotImplementedError
+        return loss
+
+    def _zero_loss(self, ref):
+        return torch.zeros((), dtype=ref.dtype, device=ref.device)
+
+    def _bcns_loss(self, x_0_hat, target, mask, tau2):
+        if target is None:
+            return self._zero_loss(x_0_hat)
+        return target_discrepancy_loss(
+            mu=x_0_hat,
+            target=target,
+            mask_known=mask,
+            tau2=tau2,
+        )
+
+    def _component_grad_norm(self, loss, x_0_hat):
+        if (not loss.requires_grad) or float(loss.detach().abs().item()) == 0.0:
+            return torch.zeros((), dtype=x_0_hat.dtype, device=x_0_hat.device)
+        grad = torch.autograd.grad(
+            outputs=loss,
+            inputs=x_0_hat,
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+        if grad is None:
+            return torch.zeros((), dtype=x_0_hat.dtype, device=x_0_hat.device)
+        return torch.linalg.norm(grad.reshape(-1))
+
+    def _target_for_step(self, x_0_hat, measurement, mask, tau2, selected, gamma):
+        if gamma == 0.0:
+            return None, {}, False, False, True
+        if selected:
+            result = self.bcns_target_builder(
+                mu=x_0_hat,
+                measurement=measurement,
+                mask_known=mask,
+                tau2=tau2,
+            )
+            target = result.target.detach()
+            diagnostics = dict(result.diagnostics)
+            self._last_target = target
+            self._last_target_diagnostics = dict(diagnostics)
+            return target, diagnostics, True, False, False
+        if self.bcns_reuse_last_target and self._last_target is not None:
+            return self._last_target.detach(), dict(self._last_target_diagnostics), False, True, False
+        return None, {}, False, False, True
+
+    def conditioning(
+        self,
+        x_prev,
+        x_t,
+        x_0_hat,
+        measurement,
+        noisy_measurement=None,
+        mask=None,
+        **kwargs,
+    ):
+        if mask is None:
+            raise ValueError("MCGBCNSGuidance requires DPS inpainting mask where mask == 1 is known.")
+
+        t_index = kwargs.get("t_index", kwargs.get("idx", None))
+        num_steps = kwargs.get("num_steps", None)
+        gamma, tau2 = self._gamma_and_tau2(**kwargs)
+        selected = self._selected_for_bcns(t_index)
+
+        meas_loss = self._measurement_loss(
+            x_0_hat=x_0_hat,
+            measurement=measurement,
+            mask=mask,
+        )
+        target, target_diagnostics, target_recomputed, target_reused, target_skipped = self._target_for_step(
+            x_0_hat=x_0_hat,
+            measurement=measurement,
+            mask=mask,
+            tau2=tau2,
+            selected=selected,
+            gamma=gamma,
+        )
+        if target is None:
+            bcns_loss = self._zero_loss(x_0_hat)
+            disp_stats = {
+                "target_disp_full": torch.zeros((), dtype=x_prev.dtype, device=x_prev.device),
+                "target_disp_known": torch.zeros((), dtype=x_prev.dtype, device=x_prev.device),
+                "target_disp_hole": torch.zeros((), dtype=x_prev.dtype, device=x_prev.device),
+                "target_mse_full": torch.zeros((), dtype=x_prev.dtype, device=x_prev.device),
+                "target_mse_known": torch.zeros((), dtype=x_prev.dtype, device=x_prev.device),
+                "target_mse_hole": torch.zeros((), dtype=x_prev.dtype, device=x_prev.device),
+            }
+        else:
+            disp_stats = target_displacement_stats(
+                mu=x_0_hat,
+                target=target,
+                mask_known=mask,
+            )
+            bcns_loss = self._bcns_loss(
+                x_0_hat=x_0_hat,
+                target=target,
+                mask=mask,
+                tau2=tau2,
+            )
+
+        # The DPS UNet uses a custom checkpoint function that cannot be traversed
+        # by two separate backward passes. Use one exact combined VJP for the
+        # sampler update, and log component norms in x0-space for trace strength.
+        meas_grad_norm = self._component_grad_norm(meas_loss, x_0_hat)
+        bcns_grad_norm = self._component_grad_norm(bcns_loss, x_0_hat)
+        meas_update_norm = self.mcg_scale * meas_grad_norm
+        bcns_update_norm = self.bcns_scale * gamma * bcns_grad_norm
+        eps = torch.finfo(x_prev.dtype).eps
+        grad_ratio = bcns_grad_norm / (meas_grad_norm + eps)
+        update_ratio = bcns_update_norm / (meas_update_norm + eps)
+
+        combined_loss = self.mcg_scale * meas_loss + self.bcns_scale * gamma * bcns_loss
+        if (not combined_loss.requires_grad) or float(combined_loss.detach().abs().item()) == 0.0:
+            combined_update = torch.zeros_like(x_prev)
+        else:
+            combined_update = torch.autograd.grad(
+                outputs=combined_loss,
+                inputs=x_prev,
+                retain_graph=False,
+                allow_unused=True,
+            )[0]
+            if combined_update is None:
+                combined_update = torch.zeros_like(x_prev)
+
+        x_t = x_t - combined_update
+        x_t = self._project_if_requested(x_t, noisy_measurement, mask)
+        total_loss = meas_loss + bcns_loss
+
+        self.last_diagnostics = {
+            "t_index": t_index,
+            "num_steps": num_steps,
+            "meas_loss": float(meas_loss.detach().item()),
+            "bcns_loss": float(bcns_loss.detach().item()),
+            "total_loss": float(total_loss.detach().item()),
+            "loss": float(total_loss.detach().item()),
+            "meas_grad_norm": float(meas_grad_norm.detach().item()),
+            "bcns_grad_norm": float(bcns_grad_norm.detach().item()),
+            "meas_update_norm": float(meas_update_norm.detach().item()),
+            "bcns_update_norm": float(bcns_update_norm.detach().item()),
+            "bcns_to_meas_grad_ratio": float(grad_ratio.detach().item()),
+            "bcns_to_meas_update_ratio": float(update_ratio.detach().item()),
+            "bcns_gamma": float(gamma),
+            "bcns_tau2": float(tau2),
+            "bcns_target_recomputed": bool(target_recomputed),
+            "bcns_target_reused": bool(target_reused),
+            "bcns_target_skipped": bool(target_skipped),
+            "apply_noisy_known_projection": self.apply_noisy_known_projection,
+            "mcg_scale": self.mcg_scale,
+            "bcns_scale": self.bcns_scale,
+            "bcns_gamma_max": self.bcns_schedule.gamma_max,
+            "bcns_apply_every_n_steps": self.bcns_apply_every_n_steps,
+            "bcns_reuse_last_target": self.bcns_reuse_last_target,
+            "bcns_target_builder": self.bcns_target_builder_name,
+        }
+        self.last_diagnostics.update(target_diagnostics)
+        self.last_diagnostics.update(
+            {key: float(value.detach().item()) for key, value in disp_stats.items()}
+        )
+        self._append_trace(self.last_diagnostics)
+        if self.debug:
+            print(
+                f"[MCG+BCNS] t={t_index} meas={self.last_diagnostics['meas_loss']:.6g} "
+                f"bcns={self.last_diagnostics['bcns_loss']:.6g} "
+                f"g_meas={self.last_diagnostics['meas_grad_norm']:.6g} "
+                f"g_bcns={self.last_diagnostics['bcns_grad_norm']:.6g} "
+                f"ratio={self.last_diagnostics['bcns_to_meas_update_ratio']:.6g} "
+                f"gamma={gamma:.6g} recomputed={target_recomputed} reused={target_reused} "
+                f"skipped={target_skipped} project={self.apply_noisy_known_projection}"
+            )
+        return x_t, total_loss.detach()
         
 @register_conditioning_method(name='ps')
 class PosteriorSampling(ConditioningMethod):
