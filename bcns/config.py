@@ -3,7 +3,17 @@
 from dataclasses import dataclass, field
 
 
-POISSON_METHODS = {"jacobi", "gs_rb", "sor_rb", "cg", "dense_reference"}
+POISSON_METHODS = {
+    "jacobi",
+    "gs_rb",
+    "sor",
+    "sor_rb",
+    "cg",
+    "dense_reference",
+    "ftcs",
+    "be",
+    "cn",
+}
 INTEGRATORS = {"ftcs", "imex_be", "imex_cn"}
 VORTICITY_ESTIMATORS = {"fd", "finite_difference", "polynomial"}
 VORTICITY_BOUNDARY_MODES = {"hard", "none"}
@@ -28,6 +38,7 @@ class PoissonSolverConfig:
     tol: float = 1e-8
     omega: float = 1.7
     h: float = 1.0
+    dt: float = 1.0
     record_history: bool = True
 
     def __post_init__(self) -> None:
@@ -40,6 +51,7 @@ class PoissonSolverConfig:
             raise ValueError("max_iter must be positive.")
         _require_positive("tol", self.tol)
         _require_positive("h", self.h)
+        _require_positive("dt", self.dt)
         if not (0.0 < self.omega < 2.0):
             raise ValueError("omega must satisfy 0 < omega < 2 for SOR.")
 

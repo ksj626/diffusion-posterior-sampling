@@ -1,7 +1,7 @@
 """Poisson and harmonic scalar structure targets for BCNS DPS Step 2."""
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -86,6 +86,24 @@ def _final_residual(history: List[float]) -> float:
     return float(history[-1]) if history else float("nan")
 
 
+def _solver_dt_for_method(
+    poisson_method: str,
+    solver_dt: Optional[float],
+    solver_dt_ftcs: float,
+    solver_dt_be: float,
+    solver_dt_cn: float,
+) -> float:
+    if solver_dt is not None:
+        return float(solver_dt)
+    if poisson_method == "ftcs":
+        return float(solver_dt_ftcs)
+    if poisson_method == "be":
+        return float(solver_dt_be)
+    if poisson_method == "cn":
+        return float(solver_dt_cn)
+    return 1.0
+
+
 def build_poisson_structure_target(
     mu: torch.Tensor,
     measurement: torch.Tensor,
@@ -98,6 +116,10 @@ def build_poisson_structure_target(
     poisson_tol: float = 1e-4,
     poisson_omega: float = 1.7,
     poisson_h: float = 1.0,
+    solver_dt: Optional[float] = None,
+    solver_dt_ftcs: float = 0.2,
+    solver_dt_be: float = 1.0,
+    solver_dt_cn: float = 1.0,
     record_history: bool = True,
 ) -> PoissonStructureTargetResult:
     """Solve a masked harmonic/Poisson scalar structure target in the hole."""
@@ -121,12 +143,20 @@ def build_poisson_structure_target(
         rhs_mode=rhs_mode,
         h=poisson_h,
     )
+    selected_solver_dt = _solver_dt_for_method(
+        poisson_method=poisson_method,
+        solver_dt=solver_dt,
+        solver_dt_ftcs=solver_dt_ftcs,
+        solver_dt_be=solver_dt_be,
+        solver_dt_cn=solver_dt_cn,
+    )
     config = PoissonSolverConfig(
         method=poisson_method,
         max_iter=poisson_max_iter,
         tol=poisson_tol,
         omega=poisson_omega,
         h=poisson_h,
+        dt=selected_solver_dt,
         record_history=record_history,
     )
     with torch.no_grad():
@@ -144,6 +174,11 @@ def build_poisson_structure_target(
 
     diagnostics: Dict[str, object] = {
         "poisson_method": poisson_method,
+        "elliptic_solver": poisson_method,
+        "solver_tol": float(poisson_tol),
+        "solver_max_iter": int(poisson_max_iter),
+        "solver_dt": float(selected_solver_dt),
+        "solver_num_iter": int(solver_result.num_iter),
         "poisson_num_iter": int(solver_result.num_iter),
         "poisson_converged": bool(solver_result.converged),
         "poisson_final_residual": _final_residual(solver_result.residual_history),
@@ -154,6 +189,12 @@ def build_poisson_structure_target(
         "target_disp": float(target_disp.item()),
     }
     diagnostics.update(solver_result.diagnostics)
+    diagnostics["poisson_method"] = poisson_method
+    diagnostics["elliptic_solver"] = poisson_method
+    diagnostics["solver_tol"] = float(poisson_tol)
+    diagnostics["solver_max_iter"] = int(poisson_max_iter)
+    diagnostics["solver_dt"] = float(selected_solver_dt)
+    diagnostics["solver_num_iter"] = int(solver_result.num_iter)
     return PoissonStructureTargetResult(
         structure=structure.detach(),
         boundary_values=boundary_values.detach(),

@@ -31,8 +31,10 @@ from bcns.eval_table import (
 )
 from bcns.masks import (
     make_center_box_mask,
+    make_center_keep_unknown_mask,
     make_center_box_unknown_mask,
     make_freeform_medium_mask,
+    make_global_random_unknown_mask,
     make_text_like_mask,
     make_thick_scratch_mask,
     make_thin_scratch_mask,
@@ -46,7 +48,7 @@ from guided_diffusion.measurements import get_noise, get_operator
 from guided_diffusion.unet import create_model
 from util.img_utils import mask_generator
 
-ALLOWED_SAMPLING_STEPS = (5, 10, 25, 50, 100, 250, 1000)
+ALLOWED_SAMPLING_STEPS = (5, 10, 20, 25, 50, 100, 250, 1000)
 DEFAULT_HOLE_VARIANTS = (
     "thin_scratch",
     "thick_scratch_12",
@@ -55,6 +57,19 @@ DEFAULT_HOLE_VARIANTS = (
     "freeform_medium",
     "center_box_96",
     "center_box_128",
+    "center_keep_96",
+    "center_keep_128",
+    "global_random_50_60",
+)
+MAIN_RESULT_MASKS = (
+    "thick_scratch_24",
+    "text_mask",
+    "freeform_medium",
+    "center_box_96",
+    "center_box_128",
+    "center_keep_96",
+    "center_keep_128",
+    "global_random_50_60",
 )
 
 
@@ -141,6 +156,11 @@ def _poisson_params(
     rhs_mode: str = None,
     projected: bool = True,
     poisson_max_iter: int = 200,
+    poisson_tol: float = 1e-4,
+    solver_dt: float = None,
+    solver_dt_ftcs: float = 0.2,
+    solver_dt_be: float = 1.0,
+    solver_dt_cn: float = 1.0,
     lambda_structure: float = 0.05,
     prox_steps: int = 1,
     prox_step_size: float = 0.05,
@@ -160,9 +180,12 @@ def _poisson_params(
             "boundary_mode": "normalized_known_smooth",
             "poisson_method": poisson_method,
             "poisson_max_iter": int(poisson_max_iter),
-            "poisson_tol": 1e-4,
+            "poisson_tol": float(poisson_tol),
             "poisson_omega": 1.7,
             "poisson_h": 1.0,
+            "solver_dt_ftcs": float(solver_dt_ftcs),
+            "solver_dt_be": float(solver_dt_be),
+            "solver_dt_cn": float(solver_dt_cn),
         },
         "gamma_max": float(gamma_max),
         "tau2": 1.0,
@@ -175,6 +198,8 @@ def _poisson_params(
     }
     if rhs_mode is not None:
         params["target_builder_params"]["rhs_mode"] = rhs_mode
+    if solver_dt is not None:
+        params["target_builder_params"]["solver_dt"] = float(solver_dt)
     return params
 
 
@@ -324,6 +349,14 @@ def _mcg_bcns_lift_params(
     bcns_ratio_control: bool = False,
     bcns_target_update_ratio: float = 0.03,
     bcns_ratio_clip_max: float = 100.0,
+    poisson_method: str = "sor_rb",
+    poisson_max_iter: int = 100,
+    poisson_tol: float = 1e-4,
+    solver_dt: float = None,
+    solver_dt_ftcs: float = 0.2,
+    solver_dt_be: float = 1.0,
+    solver_dt_cn: float = 1.0,
+    rhs_mode: str = None,
 ):
     builder_params = {
         "lift_scale": float(lift_scale),
@@ -335,19 +368,25 @@ def _mcg_bcns_lift_params(
         builder_params.update(
             {
                 "rhs_mode": "zero",
-                "poisson_method": "sor_rb",
-                "poisson_max_iter": 100,
-                "poisson_tol": 1e-4,
+                "poisson_method": poisson_method,
+                "poisson_max_iter": int(poisson_max_iter),
+                "poisson_tol": float(poisson_tol),
+                "solver_dt_ftcs": float(solver_dt_ftcs),
+                "solver_dt_be": float(solver_dt_be),
+                "solver_dt_cn": float(solver_dt_cn),
             }
         )
     elif source == "poisson":
         target_builder = "luminance_lift_poisson"
         builder_params.update(
             {
-                "rhs_mode": "projected_mu_laplacian",
-                "poisson_method": "sor_rb",
-                "poisson_max_iter": 100,
-                "poisson_tol": 1e-4,
+                "rhs_mode": rhs_mode or "projected_mu_laplacian",
+                "poisson_method": poisson_method,
+                "poisson_max_iter": int(poisson_max_iter),
+                "poisson_tol": float(poisson_tol),
+                "solver_dt_ftcs": float(solver_dt_ftcs),
+                "solver_dt_be": float(solver_dt_be),
+                "solver_dt_cn": float(solver_dt_cn),
             }
         )
     elif source == "flow":
@@ -375,6 +414,8 @@ def _mcg_bcns_lift_params(
         )
     else:
         raise ValueError("source must be one of 'flow', 'poisson', or 'harmonic'.")
+    if solver_dt is not None and source in ("harmonic", "poisson"):
+        builder_params["solver_dt"] = float(solver_dt)
 
     return {
         "mcg_scale": float(mcg_scale),
@@ -486,6 +527,14 @@ def _mcg_bcns_with_metadata(
     bcns_ratio_control=False,
     bcns_target_update_ratio=0.03,
     bcns_ratio_clip_max=100.0,
+    poisson_method="sor_rb",
+    poisson_max_iter=100,
+    poisson_tol=1e-4,
+    solver_dt=None,
+    solver_dt_ftcs=0.2,
+    solver_dt_be=1.0,
+    solver_dt_cn=1.0,
+    rhs_mode=None,
     **meta,
 ):
     params = _mcg_bcns_lift_params(
@@ -503,6 +552,14 @@ def _mcg_bcns_with_metadata(
         bcns_ratio_control=bcns_ratio_control,
         bcns_target_update_ratio=bcns_target_update_ratio,
         bcns_ratio_clip_max=bcns_ratio_clip_max,
+        poisson_method=poisson_method,
+        poisson_max_iter=poisson_max_iter,
+        poisson_tol=poisson_tol,
+        solver_dt=solver_dt,
+        solver_dt_ftcs=solver_dt_ftcs,
+        solver_dt_be=solver_dt_be,
+        solver_dt_cn=solver_dt_cn,
+        rhs_mode=rhs_mode,
     )
     builder_params = params["bcns_target_builder_params"]
     merged = {
@@ -518,6 +575,14 @@ def _mcg_bcns_with_metadata(
         "bcns_ratio_control": bool(params.get("bcns_ratio_control", False)),
         "bcns_target_update_ratio": float(params.get("bcns_target_update_ratio", 0.03)),
         "bcns_ratio_clip_max": float(params.get("bcns_ratio_clip_max", 100.0)),
+        "elliptic_solver": builder_params.get("poisson_method", ""),
+        "poisson_method": builder_params.get("poisson_method", ""),
+        "solver_tol": builder_params.get("poisson_tol", ""),
+        "solver_max_iter": builder_params.get("poisson_max_iter", ""),
+        "solver_dt": builder_params.get("solver_dt", ""),
+        "solver_dt_ftcs": builder_params.get("solver_dt_ftcs", ""),
+        "solver_dt_be": builder_params.get("solver_dt_be", ""),
+        "solver_dt_cn": builder_params.get("solver_dt_cn", ""),
     }
     merged.update(meta)
     return _method_with_metadata(method, "mcg_bcns", params, **merged)
@@ -549,6 +614,67 @@ def _lift_candidate_configs(scale_default: float):
             )
         )
     return configs
+
+
+def _main_harmonic_best(method_name: str = "mcg_bcns_harmonic_best", solver: str = "sor", **meta):
+    meta.setdefault("sweep_family", "main_result")
+    return _mcg_bcns_with_metadata(
+        method_name,
+        "harmonic",
+        1.0,
+        projected=True,
+        bcns_gamma_max=0.5,
+        mcg_scale=1.0,
+        apply_every_n_steps=2,
+        bcns_ratio_control=True,
+        bcns_target_update_ratio=0.3,
+        bcns_ratio_clip_max=10000.0,
+        poisson_method=solver,
+        poisson_max_iter=200,
+        poisson_tol=1e-4,
+        **meta,
+    )
+
+
+def _main_poisson_best(method_name: str = "mcg_bcns_poisson_best", solver: str = "sor", **meta):
+    meta.setdefault("sweep_family", "main_result")
+    return _mcg_bcns_with_metadata(
+        method_name,
+        "poisson",
+        4.0,
+        projected=True,
+        bcns_gamma_max=0.5,
+        mcg_scale=1.0,
+        apply_every_n_steps=2,
+        bcns_ratio_control=True,
+        bcns_target_update_ratio=1.0,
+        bcns_ratio_clip_max=1000.0,
+        poisson_method=solver,
+        poisson_max_iter=200,
+        poisson_tol=1e-4,
+        rhs_mode="projected_mu_laplacian",
+        **meta,
+    )
+
+
+def _main_harmonic_frequency_best():
+    return _mcg_bcns_with_metadata(
+        "mcg_bcns_harmonic_freq_best",
+        "harmonic",
+        1.0,
+        projected=True,
+        bcns_gamma_max=0.5,
+        mcg_scale=1.0,
+        apply_every_n_steps=1,
+        bcns_ratio_control=True,
+        bcns_target_update_ratio=0.3,
+        bcns_ratio_clip_max=1000.0,
+        poisson_method="sor",
+        poisson_max_iter=200,
+        poisson_tol=1e-4,
+        sweep_family="main_frequency",
+        selected_config_alias="harmonic_r0.3_clip1000_every1",
+    )
 
 
 def method_configs(ablation_set: str, scale_default: float, full_strength_grid: bool = False):
@@ -981,6 +1107,48 @@ def method_configs(ablation_set: str, scale_default: float, full_strength_grid: 
                     )
         return configs
 
+    if ablation_set == "bcns_main_methods":
+        return [
+            _method_with_metadata("ps", "ps", {"scale": scale_default}, sweep_family="main_methods"),
+            _method_with_metadata("projection_fixed", "projection_fixed", {}, sweep_family="main_methods"),
+            _mcg_fixed_scaled(1.0),
+            _main_harmonic_best(),
+            _main_poisson_best(),
+        ]
+
+    if ablation_set == "bcns_main_solver_ablation_harmonic":
+        configs = [_mcg_fixed_scaled(1.0)]
+        for solver in ("sor", "cg", "ftcs", "be", "cn"):
+            configs.append(
+                _main_harmonic_best(
+                    f"mcg_bcns_harmonic_best_{solver}",
+                    solver=solver,
+                    sweep_family="main_solver_harmonic",
+                    ablation_elliptic_solver=solver,
+                )
+            )
+        return configs
+
+    if ablation_set == "bcns_main_solver_ablation_poisson":
+        configs = [_mcg_fixed_scaled(1.0)]
+        for solver in ("sor", "cg", "ftcs", "be", "cn"):
+            configs.append(
+                _main_poisson_best(
+                    f"mcg_bcns_poisson_best_{solver}",
+                    solver=solver,
+                    sweep_family="main_solver_poisson",
+                    ablation_elliptic_solver=solver,
+                )
+            )
+        return configs
+
+    if ablation_set == "bcns_main_frequency_ablation":
+        return [
+            _mcg_fixed_scaled(1.0),
+            _main_harmonic_best(sweep_family="main_frequency"),
+            _main_harmonic_frequency_best(),
+        ]
+
     if ablation_set == "mcg_bcns_main":
         return [
             _method_with_metadata("ps", "ps", {"scale": scale_default}),
@@ -1376,6 +1544,32 @@ def make_mask(args, mask_gen, ref_img, seed=None):
             device=ref_img.device,
             dtype=ref_img.dtype,
         )
+    elif args.mask_mode == "center_keep_96":
+        unknown = make_center_keep_unknown_mask(
+            height,
+            width,
+            box_size=96,
+            device=ref_img.device,
+            dtype=ref_img.dtype,
+        )
+    elif args.mask_mode == "center_keep_128":
+        unknown = make_center_keep_unknown_mask(
+            height,
+            width,
+            box_size=128,
+            device=ref_img.device,
+            dtype=ref_img.dtype,
+        )
+    elif args.mask_mode == "global_random_50_60":
+        unknown = make_global_random_unknown_mask(
+            height,
+            width,
+            min_unknown_fraction=0.5,
+            max_unknown_fraction=0.6,
+            seed=seed,
+            device=ref_img.device,
+            dtype=ref_img.dtype,
+        )
     elif args.mask_mode == "thin_scratch":
         unknown = make_thin_scratch_mask(
             height,
@@ -1596,6 +1790,9 @@ def main():
             "freeform_medium",
             "center_box_96",
             "center_box_128",
+            "center_keep_96",
+            "center_keep_128",
+            "global_random_50_60",
         ),
         default="thin_scratch",
     )
@@ -1630,6 +1827,10 @@ def main():
             "mcg_bcns_apply_every_sweep",
             "mcg_bcns_flow_evolution_sweep",
             "mcg_bcns_ultra_fewstep",
+            "bcns_main_methods",
+            "bcns_main_solver_ablation_harmonic",
+            "bcns_main_solver_ablation_poisson",
+            "bcns_main_frequency_ablation",
         ),
         default="smoke",
     )
@@ -1766,6 +1967,7 @@ def main():
                     diagnostics=diagnostics,
                     structural_sigma=args.structural_sigma,
                     boundary_width=args.boundary_width,
+                    require_lpips=True,
                 )
             )
             row["recon_raw_min"] = float(recon_raw.min().item())

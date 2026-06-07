@@ -307,6 +307,45 @@ def make_center_box_unknown_mask(
     return make_center_box_mask(height, width, box_size, box_size, device=device, dtype=dtype)
 
 
+def make_center_keep_unknown_mask(
+    height: int,
+    width: int,
+    box_size: int = 96,
+    device=None,
+    dtype=None,
+) -> torch.Tensor:
+    """Return an unknown mask with only the center box kept/known."""
+
+    known_center = make_center_box_mask(height, width, box_size, box_size, device=device, dtype=dtype)
+    return (1.0 - known_center).to(dtype=dtype or torch.float32)
+
+
+def make_global_random_unknown_mask(
+    height: int,
+    width: int,
+    min_unknown_fraction: float = 0.5,
+    max_unknown_fraction: float = 0.6,
+    seed: Optional[int] = None,
+    device=None,
+    dtype=None,
+) -> torch.Tensor:
+    """Return a reproducible global Bernoulli unknown mask."""
+
+    _validate_size(height, width)
+    if not (0.0 <= min_unknown_fraction <= max_unknown_fraction <= 1.0):
+        raise ValueError("unknown fractions must satisfy 0 <= min <= max <= 1.")
+    rng = random.Random(seed)
+    unknown_fraction = rng.uniform(float(min_unknown_fraction), float(max_unknown_fraction))
+    generator = torch.Generator(device="cpu")
+    if seed is not None:
+        generator.manual_seed(int(seed))
+    else:
+        generator.seed()
+    values = torch.rand((1, 1, height, width), generator=generator)
+    mask = (values < unknown_fraction).to(dtype=dtype or torch.float32)
+    return mask.to(device=device)
+
+
 def mask_metadata(mask_unknown: torch.Tensor) -> dict:
     """Return approximate geometry metadata for a binary unknown mask."""
 
@@ -334,6 +373,7 @@ def mask_metadata(mask_unknown: torch.Tensor) -> dict:
     )
     num_components_approx = int(starts.sum().item())
     return {
+        "mask_unknown_fraction": hole_ratio,
         "hole_ratio": hole_ratio,
         "known_ratio": known_ratio,
         "boundary_length_approx": boundary_length_approx,

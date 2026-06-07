@@ -1,18 +1,20 @@
 """Reusable evaluation metrics for BCNS-DPS inpainting outputs."""
 
 import math
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from .dps_adapter import (
     hole_from_known,
-    masked_mean_square,
     split_known_hole_mse,
     validate_image_tensor,
     validate_mask_tensor,
 )
+
+
+_LPIPS_CACHE: Dict[Tuple[str, str], Any] = {}
 
 
 def _validate_pair(pred: torch.Tensor, target: torch.Tensor) -> None:
@@ -118,24 +120,77 @@ def mae_regions(pred: torch.Tensor, target: torch.Tensor, mask_known: torch.Tens
     }
 
 
-def lpips_optional(pred: torch.Tensor, target: torch.Tensor, net: str = "alex") -> Optional[float]:
-    """Return LPIPS if the optional dependency is installed, otherwise ``None``."""
+def _lpips_inputs(pred: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    pred_eval = pred
+    target_eval = target
+    if pred_eval.shape[1] == 1:
+        pred_eval = pred_eval.repeat(1, 3, 1, 1)
+        target_eval = target_eval.repeat(1, 3, 1, 1)
+    if pred_eval.shape[1] != 3:
+        raise ValueError(f"LPIPS expects 1 or 3 channels, got {pred_eval.shape[1]}.")
+    return pred_eval.clamp(-1, 1), target_eval.clamp(-1, 1)
+
+
+def lpips_metric(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    net: str = "alex",
+    loss_fn: Optional[Any] = None,
+) -> float:
+    """Return LPIPS and fail clearly if the optional dependency is unavailable."""
 
     _validate_pair(pred, target)
+    pred_eval, target_eval = _lpips_inputs(pred, target)
+    if loss_fn is None:
+        try:
+            import lpips  # type: ignore
+        except Exception as exc:
+            raise ImportError(
+                "LPIPS metric requires the optional 'lpips' package. "
+                "Install it before running main BCNS result experiments."
+            ) from exc
+        key = (str(net), str(pred.device))
+        if key not in _LPIPS_CACHE:
+            model = lpips.LPIPS(net=net)
+            if hasattr(model, "to"):
+                model = model.to(device=pred.device)
+            if hasattr(model, "eval"):
+                model.eval()
+            _LPIPS_CACHE[key] = model
+        loss_fn = _LPIPS_CACHE[key]
+    with torch.no_grad():
+        value = loss_fn(pred_eval, target_eval).mean()
+    output = float(value.detach().item())
+    if not math.isfinite(output):
+        raise RuntimeError("LPIPS returned a non-finite value.")
+    return output
+
+
+def hole_focused_lpips(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask_known: torch.Tensor,
+    net: str = "alex",
+    loss_fn: Optional[Any] = None,
+) -> float:
+    """Return LPIPS on a hole-focused composite against the full target."""
+
+    _validate_pair(pred, target)
+    validate_mask_tensor(mask_known, pred, "mask_known")
+    known = mask_known.to(dtype=pred.dtype, device=pred.device)
+    hole_focused = pred * (1.0 - known) + target * known
+    return lpips_metric(hole_focused, target, net=net, loss_fn=loss_fn)
+
+
+def lpips_optional(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    net: str = "alex",
+    loss_fn: Optional[Any] = None,
+) -> Optional[float]:
+    """Return LPIPS if available; legacy helper for non-main tests."""
+
     try:
-        import lpips  # type: ignore
-    except Exception:
-        return None
-    try:
-        pred_eval = pred
-        target_eval = target
-        if pred_eval.shape[1] == 1:
-            pred_eval = pred_eval.repeat(1, 3, 1, 1)
-            target_eval = target_eval.repeat(1, 3, 1, 1)
-        loss_fn = lpips.LPIPS(net=net).to(device=pred.device)
-        loss_fn.eval()
-        with torch.no_grad():
-            value = loss_fn(pred_eval.clamp(-1, 1), target_eval.clamp(-1, 1)).mean()
-        return float(value.detach().item())
-    except Exception:
+        return lpips_metric(pred, target, net=net, loss_fn=loss_fn)
+    except ImportError:
         return None

@@ -7,7 +7,7 @@ solver uses the SPD equivalent ``-Delta_h I = -w`` restricted to unknown pixels.
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -208,6 +208,50 @@ def _dot_masked(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> torch.T
     return (a * b * mask_f).sum()
 
 
+def _masked_cg_spd(
+    apply_a: Callable[[torch.Tensor], torch.Tensor],
+    b: torch.Tensor,
+    mask: torch.Tensor,
+    x0: torch.Tensor,
+    tol: float,
+    max_iter: int,
+    record_history: bool,
+) -> Tuple[torch.Tensor, List[float], int, bool]:
+    """Small matrix-free CG helper for SPD systems restricted to the hole."""
+
+    mask_f = mask.to(dtype=b.dtype, device=b.device)
+    x = x0 * mask_f
+    r = (b - apply_a(x)) * mask_f
+    p = r.clone()
+    rs_old = _dot_masked(r, r, mask_f)
+    denom = mask_f.sum().clamp_min(1.0)
+    history: List[float] = [float(torch.sqrt(rs_old / denom).item())]
+    if history[-1] <= tol:
+        return x, history if record_history else [history[-1]], 0, True
+    eps = torch.finfo(b.dtype).eps
+    num_iter = 0
+    converged = False
+    for it in range(1, max_iter + 1):
+        ap = apply_a(p)
+        alpha = rs_old / _dot_masked(p, ap, mask_f).clamp_min(eps)
+        x = (x + alpha * p) * mask_f
+        r = (r - alpha * ap) * mask_f
+        rs_new = _dot_masked(r, r, mask_f)
+        residual = float(torch.sqrt(rs_new / denom).item())
+        num_iter = it
+        if record_history or it == max_iter:
+            history.append(residual)
+        if residual <= tol:
+            converged = True
+            if not record_history and (not history or history[-1] != residual):
+                history.append(residual)
+            break
+        beta = rs_new / rs_old.clamp_min(eps)
+        p = (r + beta * p) * mask_f
+        rs_old = rs_new
+    return x, history, num_iter, converged
+
+
 def solve_poisson_cg(
     rhs_w: torch.Tensor,
     boundary_values: torch.Tensor,
@@ -257,6 +301,151 @@ def solve_poisson_cg(
     if not history or history[-1] != final_residual:
         history.append(final_residual)
     return _finish(solution, history, start, config.tol, num_iter, {"system": "-Delta I = -w"})
+
+
+def solve_poisson_pseudo_ftcs(
+    rhs_w: torch.Tensor,
+    boundary_values: torch.Tensor,
+    mask_unknown: torch.Tensor,
+    config: PoissonSolverConfig,
+    initial: Optional[torch.Tensor] = None,
+) -> SolverResult:
+    """Pseudo-time FTCS relaxation for the steady problem ``Delta_h u = f``."""
+
+    _validate_poisson_inputs(rhs_w, boundary_values, mask_unknown)
+    start = time.time()
+    mask = _mask_float(mask_unknown, rhs_w)
+    known = 1.0 - mask
+    solution = _initial_solution(rhs_w, boundary_values, mask_unknown, initial)
+    history: List[float] = []
+    num_iter = 0
+    for it in range(1, config.max_iter + 1):
+        residual = poisson_residual(solution, rhs_w, mask_unknown, config.h)
+        solution = (solution + config.dt * residual) * mask + boundary_values * known
+        num_iter = it
+        if config.record_history or it == config.max_iter:
+            history.append(_residual_norm(solution, rhs_w, mask_unknown, config.h))
+        if history and history[-1] <= config.tol:
+            break
+    return _finish(
+        solution,
+        history,
+        start,
+        config.tol,
+        num_iter,
+        {"method": "pseudo_ftcs", "elliptic_solver": "ftcs", "solver_dt": config.dt},
+    )
+
+
+def _solve_poisson_pseudo_implicit(
+    rhs_w: torch.Tensor,
+    boundary_values: torch.Tensor,
+    mask_unknown: torch.Tensor,
+    config: PoissonSolverConfig,
+    initial: Optional[torch.Tensor],
+    method_name: str,
+    theta: float,
+) -> SolverResult:
+    _validate_poisson_inputs(rhs_w, boundary_values, mask_unknown)
+    start = time.time()
+    mask = _mask_float(mask_unknown, rhs_w)
+    known = 1.0 - mask
+    boundary_full = boundary_values * known
+    solution = _initial_solution(rhs_w, boundary_values, mask_unknown, initial)
+    alpha = float(theta) * config.dt
+    inner_max_iter = max(1, min(config.max_iter, 50))
+    history: List[float] = []
+    total_inner_iter = 0
+    inner_converged = True
+    num_iter = 0
+
+    def apply_a(delta: torch.Tensor) -> torch.Tensor:
+        return (delta * mask - alpha * laplacian_5pt(delta * mask, config.h)) * mask
+
+    for it in range(1, config.max_iter + 1):
+        if method_name == "be":
+            rhs_full = solution - config.dt * rhs_w
+        else:
+            rhs_full = solution + alpha * laplacian_5pt(solution, config.h) - config.dt * rhs_w
+        b = (rhs_full + alpha * laplacian_5pt(boundary_full, config.h)) * mask
+        x0 = solution * mask
+        x, inner_history, inner_iter, converged = _masked_cg_spd(
+            apply_a=apply_a,
+            b=b,
+            mask=mask,
+            x0=x0,
+            tol=config.tol,
+            max_iter=inner_max_iter,
+            record_history=False,
+        )
+        total_inner_iter += int(inner_iter)
+        inner_converged = inner_converged and bool(converged)
+        solution = x * mask + boundary_values * known
+        num_iter = it
+        residual = _residual_norm(solution, rhs_w, mask_unknown, config.h)
+        if config.record_history or it == config.max_iter:
+            history.append(residual)
+        if residual <= config.tol:
+            break
+        if inner_history and inner_history[-1] <= torch.finfo(rhs_w.dtype).eps:
+            inner_converged = inner_converged and True
+
+    return _finish(
+        solution,
+        history,
+        start,
+        config.tol,
+        num_iter,
+        {
+            "method": f"pseudo_{method_name}",
+            "elliptic_solver": method_name,
+            "solver_dt": config.dt,
+            "implicit_theta": theta,
+            "implicit_inner_max_iter": inner_max_iter,
+            "implicit_total_inner_iter": int(total_inner_iter),
+            "implicit_inner_converged": bool(inner_converged),
+        },
+    )
+
+
+def solve_poisson_pseudo_be(
+    rhs_w: torch.Tensor,
+    boundary_values: torch.Tensor,
+    mask_unknown: torch.Tensor,
+    config: PoissonSolverConfig,
+    initial: Optional[torch.Tensor] = None,
+) -> SolverResult:
+    """Pseudo-time backward Euler relaxation for ``Delta_h u = f``."""
+
+    return _solve_poisson_pseudo_implicit(
+        rhs_w=rhs_w,
+        boundary_values=boundary_values,
+        mask_unknown=mask_unknown,
+        config=config,
+        initial=initial,
+        method_name="be",
+        theta=1.0,
+    )
+
+
+def solve_poisson_pseudo_cn(
+    rhs_w: torch.Tensor,
+    boundary_values: torch.Tensor,
+    mask_unknown: torch.Tensor,
+    config: PoissonSolverConfig,
+    initial: Optional[torch.Tensor] = None,
+) -> SolverResult:
+    """Pseudo-time Crank-Nicolson relaxation for ``Delta_h u = f``."""
+
+    return _solve_poisson_pseudo_implicit(
+        rhs_w=rhs_w,
+        boundary_values=boundary_values,
+        mask_unknown=mask_unknown,
+        config=config,
+        initial=initial,
+        method_name="cn",
+        theta=0.5,
+    )
 
 
 def solve_poisson_dense_reference(
@@ -324,10 +513,16 @@ def solve_poisson(
         return solve_poisson_jacobi(rhs_w, boundary_values, mask_unknown, config, initial)
     if config.method == "gs_rb":
         return solve_poisson_gauss_seidel_red_black(rhs_w, boundary_values, mask_unknown, config, initial)
-    if config.method == "sor_rb":
+    if config.method in ("sor", "sor_rb"):
         return solve_poisson_sor_red_black(rhs_w, boundary_values, mask_unknown, config, initial)
     if config.method == "cg":
         return solve_poisson_cg(rhs_w, boundary_values, mask_unknown, config, initial)
     if config.method == "dense_reference":
         return solve_poisson_dense_reference(rhs_w, boundary_values, mask_unknown, config.h)
+    if config.method == "ftcs":
+        return solve_poisson_pseudo_ftcs(rhs_w, boundary_values, mask_unknown, config, initial)
+    if config.method == "be":
+        return solve_poisson_pseudo_be(rhs_w, boundary_values, mask_unknown, config, initial)
+    if config.method == "cn":
+        return solve_poisson_pseudo_cn(rhs_w, boundary_values, mask_unknown, config, initial)
     raise ValueError(f"Unsupported Poisson method {config.method!r}.")

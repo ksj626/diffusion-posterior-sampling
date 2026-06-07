@@ -8,7 +8,15 @@ from typing import Dict, Iterable, List, Optional
 
 import torch
 
-from .eval_metrics import lpips_optional, mae_regions, mse_regions, psnr, ssim_simple
+from .eval_metrics import (
+    hole_focused_lpips,
+    lpips_metric,
+    lpips_optional,
+    mae_regions,
+    mse_regions,
+    psnr,
+    ssim_simple,
+)
 from .structural_metrics import (
     gradient_mismatch,
     isophote_angle_error,
@@ -42,6 +50,8 @@ def evaluate_inpainting_result(
     diagnostics: Optional[dict] = None,
     structural_sigma: float = 1.0,
     boundary_width: int = 3,
+    require_lpips: bool = False,
+    lpips_loss_fn=None,
 ) -> dict:
     """Return a flat metric dict for one inpainting reconstruction."""
 
@@ -55,8 +65,18 @@ def evaluate_inpainting_result(
         row[f"{prefix}_hole_ssim"] = ssim_simple(recon, label, hole)
         row.update(_prefixed(prefix, mse_regions(recon, label, mask_known)))
         row.update(_prefixed(prefix, mae_regions(recon, label, mask_known)))
-        lpips_value = lpips_optional(recon, label)
+        if require_lpips:
+            lpips_value = lpips_metric(recon, label, loss_fn=lpips_loss_fn)
+            hole_lpips_value = hole_focused_lpips(recon, label, mask_known, loss_fn=lpips_loss_fn)
+        else:
+            lpips_value = lpips_optional(recon, label, loss_fn=lpips_loss_fn)
+            hole_lpips_value = (
+                None
+                if lpips_value is None
+                else hole_focused_lpips(recon, label, mask_known, loss_fn=lpips_loss_fn)
+            )
         row[f"{prefix}_lpips"] = "" if lpips_value is None else lpips_value
+        row[f"{prefix}_hole_lpips"] = "" if hole_lpips_value is None else hole_lpips_value
 
     for prefix, recon in (("raw", recon_raw), ("composite", recon_composite)):
         row[f"{prefix}_seam_mse"] = seam_mse(recon, label, mask_known, width=boundary_width)
@@ -166,6 +186,8 @@ def write_summary_markdown(summary: List[dict], path) -> None:
         "composite_seam_mse_mean",
         "composite_gradient_mismatch_mean",
         "composite_isophote_error_mean",
+        "composite_lpips_mean",
+        "composite_hole_lpips_mean",
         "flow_runtime_sec_mean",
         "sample_runtime_sec_mean",
     ]

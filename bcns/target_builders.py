@@ -139,6 +139,10 @@ class PoissonStructureTargetBuilder:
         poisson_tol: float = 1e-4,
         poisson_omega: float = 1.7,
         poisson_h: float = 1.0,
+        solver_dt: float = None,
+        solver_dt_ftcs: float = 0.2,
+        solver_dt_be: float = 1.0,
+        solver_dt_cn: float = 1.0,
         record_history: bool = True,
     ):
         if target_builder not in ("harmonic_structure", "poisson_structure"):
@@ -158,6 +162,10 @@ class PoissonStructureTargetBuilder:
         self.poisson_tol = poisson_tol
         self.poisson_omega = poisson_omega
         self.poisson_h = poisson_h
+        self.solver_dt = solver_dt
+        self.solver_dt_ftcs = solver_dt_ftcs
+        self.solver_dt_be = solver_dt_be
+        self.solver_dt_cn = solver_dt_cn
         self.record_history = record_history
 
     def __call__(self, mu, measurement, mask_known, **kwargs) -> TargetBuildResult:
@@ -174,6 +182,10 @@ class PoissonStructureTargetBuilder:
             poisson_tol=self.poisson_tol,
             poisson_omega=self.poisson_omega,
             poisson_h=self.poisson_h,
+            solver_dt=self.solver_dt,
+            solver_dt_ftcs=self.solver_dt_ftcs,
+            solver_dt_be=self.solver_dt_be,
+            solver_dt_cn=self.solver_dt_cn,
             record_history=self.record_history,
         )
         prox_result = structure_proximal_target_from_structure(
