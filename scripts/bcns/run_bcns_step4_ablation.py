@@ -46,7 +46,7 @@ from guided_diffusion.measurements import get_noise, get_operator
 from guided_diffusion.unet import create_model
 from util.img_utils import mask_generator
 
-ALLOWED_SAMPLING_STEPS = (25, 50, 100, 250, 1000)
+ALLOWED_SAMPLING_STEPS = (5, 10, 25, 50, 100, 250, 1000)
 DEFAULT_HOLE_VARIANTS = (
     "thin_scratch",
     "thick_scratch_12",
@@ -517,6 +517,7 @@ def _mcg_bcns_with_metadata(
         "flow_nu": builder_params.get("nu", ""),
         "bcns_ratio_control": bool(params.get("bcns_ratio_control", False)),
         "bcns_target_update_ratio": float(params.get("bcns_target_update_ratio", 0.03)),
+        "bcns_ratio_clip_max": float(params.get("bcns_ratio_clip_max", 100.0)),
     }
     merged.update(meta)
     return _method_with_metadata(method, "mcg_bcns", params, **merged)
@@ -1174,6 +1175,167 @@ def method_configs(ablation_set: str, scale_default: float, full_strength_grid: 
             ),
         ]
 
+    if ablation_set == "mcg_bcns_strong_ratio_sweep":
+        configs = [_mcg_fixed_scaled(1.0)]
+        for source, lift_scale in (("harmonic", 1.0), ("poisson", 4.0)):
+            for ratio in (0.1, 0.3, 1.0, 3.0):
+                configs.append(
+                    _mcg_bcns_with_metadata(
+                        f"{source}_r{_lift_label(ratio)}_clip1000_every2",
+                        source,
+                        lift_scale,
+                        projected=True,
+                        bcns_gamma_max=0.5,
+                        mcg_scale=1.0,
+                        apply_every_n_steps=2,
+                        bcns_ratio_control=True,
+                        bcns_target_update_ratio=ratio,
+                        bcns_ratio_clip_max=1000.0,
+                        sweep_family="strong_ratio",
+                    )
+                )
+        return configs
+
+    if ablation_set == "mcg_bcns_clip_sweep":
+        configs = [_mcg_fixed_scaled(1.0)]
+        for ratio in (0.3, 1.0):
+            for clip_max in (100.0, 300.0, 1000.0, 3000.0, 10000.0):
+                configs.append(
+                    _mcg_bcns_with_metadata(
+                        f"harmonic_r{_lift_label(ratio)}_clip{int(clip_max)}_every2",
+                        "harmonic",
+                        1.0,
+                        projected=True,
+                        bcns_gamma_max=0.5,
+                        mcg_scale=1.0,
+                        apply_every_n_steps=2,
+                        bcns_ratio_control=True,
+                        bcns_target_update_ratio=ratio,
+                        bcns_ratio_clip_max=clip_max,
+                        sweep_family="clip",
+                    )
+                )
+        return configs
+
+    if ablation_set == "mcg_bcns_apply_every_sweep":
+        configs = [_mcg_fixed_scaled(1.0)]
+        for ratio in (0.1, 0.3):
+            for every in (10, 5, 2, 1):
+                configs.append(
+                    _mcg_bcns_with_metadata(
+                        f"harmonic_r{_lift_label(ratio)}_every{every}",
+                        "harmonic",
+                        1.0,
+                        projected=True,
+                        bcns_gamma_max=0.5,
+                        mcg_scale=1.0,
+                        apply_every_n_steps=every,
+                        bcns_ratio_control=True,
+                        bcns_target_update_ratio=ratio,
+                        bcns_ratio_clip_max=1000.0,
+                        sweep_family="apply_every",
+                    )
+                )
+        for every in (10, 5, 2, 1):
+            configs.append(
+                _mcg_bcns_with_metadata(
+                    f"poisson_r0.3_every{every}",
+                    "poisson",
+                    4.0,
+                    projected=True,
+                    bcns_gamma_max=0.5,
+                    mcg_scale=1.0,
+                    apply_every_n_steps=every,
+                    bcns_ratio_control=True,
+                    bcns_target_update_ratio=0.3,
+                    bcns_ratio_clip_max=1000.0,
+                    sweep_family="apply_every",
+                )
+            )
+        return configs
+
+    if ablation_set == "mcg_bcns_flow_evolution_sweep":
+        configs = [_mcg_fixed_scaled(1.0)]
+        settings = [
+            (0.003, 0.001, 0.1, 4.0, 0.1),
+            (0.01, 0.001, 0.1, 8.0, 0.1),
+            (0.03, 0.001, 0.2, 8.0, 0.3),
+            (0.1, 0.001, 0.2, 16.0, 0.3),
+            (0.3, 0.001, 0.2, 16.0, 1.0),
+        ]
+        for pseudo_time, dt, nu, lift_scale, ratio in settings:
+            configs.append(
+                _mcg_bcns_with_metadata(
+                    (
+                        f"flow_pt{_float_tag(pseudo_time)}_dt{_float_tag(dt)}_nu{_float_tag(nu)}"
+                        f"_lift{_float_tag(lift_scale)}_r{_float_tag(ratio)}"
+                    ),
+                    "flow",
+                    lift_scale,
+                    projected=True,
+                    bcns_gamma_max=0.5,
+                    mcg_scale=1.0,
+                    apply_every_n_steps=2,
+                    pseudo_time=pseudo_time,
+                    dt=dt,
+                    nu=nu,
+                    bcns_ratio_control=True,
+                    bcns_target_update_ratio=ratio,
+                    bcns_ratio_clip_max=1000.0,
+                    sweep_family="flow_evolution",
+                )
+            )
+        return configs
+
+    if ablation_set == "mcg_bcns_ultra_fewstep":
+        return [
+            _method_with_metadata("ps", "ps", {"scale": scale_default}),
+            _method_with_metadata("projection_fixed", "projection_fixed", {}),
+            _mcg_fixed_scaled(1.0),
+            _mcg_bcns_with_metadata(
+                "harmonic_r0.3_clip1000_every2",
+                "harmonic",
+                1.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+                mcg_scale=1.0,
+                apply_every_n_steps=2,
+                bcns_ratio_control=True,
+                bcns_target_update_ratio=0.3,
+                bcns_ratio_clip_max=1000.0,
+                sweep_family="ultra_fewstep",
+            ),
+            _mcg_bcns_with_metadata(
+                "poisson_r0.3_clip1000_every2",
+                "poisson",
+                4.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+                mcg_scale=1.0,
+                apply_every_n_steps=2,
+                bcns_ratio_control=True,
+                bcns_target_update_ratio=0.3,
+                bcns_ratio_clip_max=1000.0,
+                sweep_family="ultra_fewstep",
+            ),
+            _mcg_bcns_with_metadata(
+                "flow_strong_r0.3_clip1000_every2",
+                "flow",
+                8.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+                mcg_scale=1.0,
+                apply_every_n_steps=2,
+                pseudo_time=0.03,
+                dt=0.001,
+                nu=0.2,
+                bcns_ratio_control=True,
+                bcns_target_update_ratio=0.3,
+                bcns_ratio_clip_max=1000.0,
+                sweep_family="ultra_fewstep",
+            ),
+        ]
+
     raise ValueError(f"Unsupported ablation_set {ablation_set!r}.")
 
 
@@ -1463,6 +1625,11 @@ def main():
             "mcg_bcns_scale_match",
             "mcg_bcns_ratio_sweep",
             "hole_variant_sweep",
+            "mcg_bcns_strong_ratio_sweep",
+            "mcg_bcns_clip_sweep",
+            "mcg_bcns_apply_every_sweep",
+            "mcg_bcns_flow_evolution_sweep",
+            "mcg_bcns_ultra_fewstep",
         ),
         default="smoke",
     )

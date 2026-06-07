@@ -49,7 +49,7 @@ def test_lift_fewstep_sweeps_sampling_steps_without_model():
     configs = method_configs("lift_fewstep", scale_default=0.3)
     steps = {meta["sampling_steps"] for _, _, _, meta in configs}
     names = set(_names(configs))
-    assert steps == {25, 50, 100, 250, 1000}
+    assert steps == {5, 10, 25, 50, 100, 250, 1000}
     assert "bcns_lift_harmonic_s1.0" in names
     assert "bcns_lift_poisson_s1.0_projected" in names
-    assert len(configs) == 35
+    assert len(configs) == 49
