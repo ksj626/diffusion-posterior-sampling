@@ -47,6 +47,15 @@ from guided_diffusion.unet import create_model
 from util.img_utils import mask_generator
 
 ALLOWED_SAMPLING_STEPS = (25, 50, 100, 250, 1000)
+DEFAULT_HOLE_VARIANTS = (
+    "thin_scratch",
+    "thick_scratch_12",
+    "thick_scratch_24",
+    "text_mask",
+    "freeform_medium",
+    "center_box_96",
+    "center_box_128",
+)
 
 
 def load_yaml(path: str) -> dict:
@@ -312,6 +321,9 @@ def _mcg_bcns_lift_params(
     pseudo_time: float = None,
     dt: float = None,
     nu: float = None,
+    bcns_ratio_control: bool = False,
+    bcns_target_update_ratio: float = 0.03,
+    bcns_ratio_clip_max: float = 100.0,
 ):
     builder_params = {
         "lift_scale": float(lift_scale),
@@ -373,6 +385,11 @@ def _mcg_bcns_lift_params(
         "bcns_ramp_power": 2.0,
         "bcns_apply_every_n_steps": int(apply_every_n_steps),
         "bcns_reuse_last_target": False,
+        "bcns_ratio_control": bool(bcns_ratio_control),
+        "bcns_target_update_ratio": float(bcns_target_update_ratio),
+        "bcns_ratio_eps": 1e-8,
+        "bcns_ratio_clip_min": 0.0,
+        "bcns_ratio_clip_max": float(bcns_ratio_clip_max),
         "bcns_target_builder": target_builder,
         "bcns_target_builder_params": builder_params,
         "apply_noisy_known_projection": bool(projected),
@@ -382,6 +399,15 @@ def _mcg_bcns_lift_params(
 
 def _method(method, conditioning, params, **meta):
     return (method, conditioning, params, meta)
+
+
+def _mcg_fixed_scaled(scale: float):
+    return _method_with_metadata(
+        f"mcg_fixed_s{_lift_label(scale)}",
+        "mcg_fixed",
+        {"scale": float(scale)},
+        mcg_scale=float(scale),
+    )
 
 
 def _method_plot_metadata(method_name: str, conditioning_name: str, params: dict) -> dict:
@@ -457,6 +483,9 @@ def _mcg_bcns_with_metadata(
     pseudo_time=None,
     dt=None,
     nu=None,
+    bcns_ratio_control=False,
+    bcns_target_update_ratio=0.03,
+    bcns_ratio_clip_max=100.0,
     **meta,
 ):
     params = _mcg_bcns_lift_params(
@@ -471,6 +500,9 @@ def _mcg_bcns_with_metadata(
         pseudo_time=pseudo_time,
         dt=dt,
         nu=nu,
+        bcns_ratio_control=bcns_ratio_control,
+        bcns_target_update_ratio=bcns_target_update_ratio,
+        bcns_ratio_clip_max=bcns_ratio_clip_max,
     )
     builder_params = params["bcns_target_builder_params"]
     merged = {
@@ -483,6 +515,8 @@ def _mcg_bcns_with_metadata(
         "flow_pseudo_time": builder_params.get("pseudo_time", ""),
         "flow_dt": builder_params.get("dt", ""),
         "flow_nu": builder_params.get("nu", ""),
+        "bcns_ratio_control": bool(params.get("bcns_ratio_control", False)),
+        "bcns_target_update_ratio": float(params.get("bcns_target_update_ratio", 0.03)),
     }
     merged.update(meta)
     return _method_with_metadata(method, "mcg_bcns", params, **merged)
@@ -1053,6 +1087,93 @@ def method_configs(ablation_set: str, scale_default: float, full_strength_grid: 
             ),
         ]
 
+    if ablation_set == "mcg_bcns_scale_match":
+        return [
+            _method_with_metadata("ps", "ps", {"scale": scale_default}),
+            _method_with_metadata("projection_fixed", "projection_fixed", {}),
+            _mcg_fixed_scaled(0.3),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_lift_harmonic_m0.3",
+                "harmonic",
+                1.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+                mcg_scale=0.3,
+            ),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_lift_poisson_m0.3",
+                "poisson",
+                2.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+                mcg_scale=0.3,
+            ),
+            _mcg_fixed_scaled(1.0),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_lift_harmonic_m1.0",
+                "harmonic",
+                1.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+                mcg_scale=1.0,
+            ),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_lift_poisson_m1.0",
+                "poisson",
+                2.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+                mcg_scale=1.0,
+            ),
+        ]
+
+    if ablation_set == "mcg_bcns_ratio_sweep":
+        configs = [_mcg_fixed_scaled(1.0)]
+        for source, lift_scale in (("harmonic", 1.0), ("poisson", 2.0)):
+            for ratio in (0.003, 0.01, 0.03, 0.1):
+                configs.append(
+                    _mcg_bcns_with_metadata(
+                        f"mcg_bcns_{source}_r{_lift_label(ratio)}",
+                        source,
+                        lift_scale,
+                        projected=True,
+                        bcns_gamma_max=0.5,
+                        mcg_scale=1.0,
+                        bcns_ratio_control=True,
+                        bcns_target_update_ratio=ratio,
+                        bcns_ratio_clip_max=100.0,
+                        ablation_bcns_target_update_ratio=float(ratio),
+                    )
+                )
+        return configs
+
+    if ablation_set == "hole_variant_sweep":
+        return [
+            _method_with_metadata("ps", "ps", {"scale": scale_default}),
+            _method_with_metadata("projection_fixed", "projection_fixed", {}),
+            _mcg_fixed_scaled(1.0),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_harmonic_best",
+                "harmonic",
+                1.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+                mcg_scale=1.0,
+                bcns_ratio_control=True,
+                bcns_target_update_ratio=0.03,
+            ),
+            _mcg_bcns_with_metadata(
+                "mcg_bcns_poisson_best",
+                "poisson",
+                2.0,
+                projected=True,
+                bcns_gamma_max=0.5,
+                mcg_scale=1.0,
+                bcns_ratio_control=True,
+                bcns_target_update_ratio=0.03,
+            ),
+        ]
+
     raise ValueError(f"Unsupported ablation_set {ablation_set!r}.")
 
 
@@ -1339,6 +1460,9 @@ def main():
             "mcg_bcns_main",
             "mcg_bcns_pde_strength",
             "mcg_bcns_projection_effect",
+            "mcg_bcns_scale_match",
+            "mcg_bcns_ratio_sweep",
+            "hole_variant_sweep",
         ),
         default="smoke",
     )
@@ -1394,7 +1518,11 @@ def main():
         mask, mask_info = make_mask(args, mask_gen, ref_img, seed=args.seed + image_index)
         measurement_clean = operator.forward(ref_img, mask=mask)
         measurement_noisy = noiser(measurement_clean)
+        initial_noise_seed = args.seed + image_index * 10007 + 777
+        set_seed(initial_noise_seed)
         x_start_base = torch.randn(ref_img.shape, device=device)
+        initial_noise_mean = float(x_start_base.detach().float().mean().cpu().item())
+        initial_noise_std = float(x_start_base.detach().float().std().cpu().item())
         comparison_groups = defaultdict(lambda: {"paths": [], "labels": []})
 
         for method_name, conditioning_name, params, meta in configs:
@@ -1414,7 +1542,7 @@ def main():
             if hasattr(cond_method, "reset_trace"):
                 cond_method.reset_trace()
             cond_fn = partial(cond_method.conditioning, mask=mask)
-            set_seed(args.seed + image_index * 10007 + 777)
+            set_seed(initial_noise_seed)
             x_start = x_start_base.clone().detach().requires_grad_()
             start_time = time.time()
             recon_raw, final_loss = run_loop(
@@ -1454,6 +1582,9 @@ def main():
             row.update(mask_info)
             row["sampling_steps"] = sampling_steps
             row["actual_num_reverse_updates"] = int(sampler.num_timesteps)
+            row["initial_noise_seed"] = int(initial_noise_seed)
+            row["initial_noise_mean"] = initial_noise_mean
+            row["initial_noise_std"] = initial_noise_std
             row["final_loss"] = float(final_loss.item())
             row["sample_runtime_sec"] = float(sample_runtime_sec)
             row.update(_method_plot_metadata(method_name, conditioning_name, params))

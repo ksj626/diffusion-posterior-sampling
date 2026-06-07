@@ -135,6 +135,17 @@ class MCGBCNSGuidance(ConditioningMethod):
         )
         self.bcns_apply_every_n_steps = int(kwargs.get("bcns_apply_every_n_steps", 5))
         self.bcns_reuse_last_target = bool(kwargs.get("bcns_reuse_last_target", False))
+        self.bcns_ratio_control = bool(kwargs.get("bcns_ratio_control", False))
+        self.bcns_target_update_ratio = float(kwargs.get("bcns_target_update_ratio", 0.03))
+        self.bcns_ratio_eps = float(kwargs.get("bcns_ratio_eps", 1e-8))
+        self.bcns_ratio_clip_min = float(kwargs.get("bcns_ratio_clip_min", 0.0))
+        self.bcns_ratio_clip_max = float(kwargs.get("bcns_ratio_clip_max", 100.0))
+        if self.bcns_target_update_ratio < 0:
+            raise ValueError("bcns_target_update_ratio must be non-negative.")
+        if self.bcns_ratio_eps <= 0:
+            raise ValueError("bcns_ratio_eps must be positive.")
+        if self.bcns_ratio_clip_min < 0 or self.bcns_ratio_clip_max < self.bcns_ratio_clip_min:
+            raise ValueError("bcns ratio clip bounds must satisfy 0 <= min <= max.")
         target_builder = kwargs.get("bcns_target_builder", "luminance_lift_poisson")
         target_builder_params = kwargs.get("bcns_target_builder_params", None) or {}
         self.bcns_target_builder_name = target_builder
@@ -174,6 +185,7 @@ class MCGBCNSGuidance(ConditioningMethod):
         meas_update_norms = [float(row.get("meas_update_norm", 0.0)) for row in rows]
         bcns_update_norms = [float(row.get("bcns_update_norm", 0.0)) for row in rows]
         update_ratios = [float(row.get("bcns_to_meas_update_ratio", 0.0)) for row in rows]
+        ratio_scales = [float(row.get("bcns_ratio_scale", 1.0)) for row in rows]
         return {
             "mean_meas_grad_norm": self._mean(meas_grad_norms),
             "mean_bcns_grad_norm": self._mean(bcns_grad_norms),
@@ -182,6 +194,8 @@ class MCGBCNSGuidance(ConditioningMethod):
             "sum_bcns_update_norm": sum(bcns_update_norms),
             "max_bcns_to_meas_update_ratio": max(update_ratios) if update_ratios else 0.0,
             "mean_bcns_to_meas_update_ratio": self._mean(update_ratios),
+            "bcns_ratio_scale_mean": self._mean(ratio_scales),
+            "bcns_ratio_scale_max": max(ratio_scales) if ratio_scales else 0.0,
             "num_bcns_nonzero_steps": sum(1 for value in bcns_grad_norms if value > 0.0),
             "num_bcns_target_recomputed": sum(
                 1 for row in rows if bool(row.get("bcns_target_recomputed", False))
@@ -201,9 +215,13 @@ class MCGBCNSGuidance(ConditioningMethod):
             "meas_grad_norm",
             "bcns_grad_norm",
             "meas_update_norm",
+            "bcns_update_raw_norm",
             "bcns_update_norm",
             "bcns_to_meas_grad_ratio",
             "bcns_to_meas_update_ratio",
+            "bcns_ratio_control",
+            "bcns_target_update_ratio",
+            "bcns_ratio_scale",
             "bcns_gamma",
             "bcns_target_recomputed",
             "bcns_target_reused",
@@ -354,12 +372,32 @@ class MCGBCNSGuidance(ConditioningMethod):
         meas_grad_norm = self._component_grad_norm(meas_loss, x_0_hat)
         bcns_grad_norm = self._component_grad_norm(bcns_loss, x_0_hat)
         meas_update_norm = self.mcg_scale * meas_grad_norm
-        bcns_update_norm = self.bcns_scale * gamma * bcns_grad_norm
+        bcns_update_raw_norm = self.bcns_scale * gamma * bcns_grad_norm
+        if self.bcns_ratio_control:
+            raw_norm_value = float(bcns_update_raw_norm.detach().item())
+            if raw_norm_value == 0.0 or not bool(torch.isfinite(bcns_update_raw_norm).item()):
+                ratio_scale = torch.zeros((), dtype=x_prev.dtype, device=x_prev.device)
+            else:
+                target_norm = self.bcns_target_update_ratio * meas_update_norm
+                ratio_scale = target_norm / (bcns_update_raw_norm + self.bcns_ratio_eps)
+                ratio_scale = torch.where(
+                    torch.isfinite(ratio_scale),
+                    ratio_scale,
+                    torch.zeros_like(ratio_scale),
+                )
+                ratio_scale = ratio_scale.clamp(
+                    min=self.bcns_ratio_clip_min,
+                    max=self.bcns_ratio_clip_max,
+                )
+        else:
+            ratio_scale = torch.ones((), dtype=x_prev.dtype, device=x_prev.device)
+        bcns_update_norm = ratio_scale * bcns_update_raw_norm
         eps = torch.finfo(x_prev.dtype).eps
         grad_ratio = bcns_grad_norm / (meas_grad_norm + eps)
         update_ratio = bcns_update_norm / (meas_update_norm + eps)
 
-        combined_loss = self.mcg_scale * meas_loss + self.bcns_scale * gamma * bcns_loss
+        effective_bcns_coeff = self.bcns_scale * gamma * ratio_scale.detach()
+        combined_loss = self.mcg_scale * meas_loss + effective_bcns_coeff * bcns_loss
         if (not combined_loss.requires_grad) or float(combined_loss.detach().abs().item()) == 0.0:
             combined_update = torch.zeros_like(x_prev)
         else:
@@ -386,9 +424,16 @@ class MCGBCNSGuidance(ConditioningMethod):
             "meas_grad_norm": float(meas_grad_norm.detach().item()),
             "bcns_grad_norm": float(bcns_grad_norm.detach().item()),
             "meas_update_norm": float(meas_update_norm.detach().item()),
+            "bcns_update_raw_norm": float(bcns_update_raw_norm.detach().item()),
             "bcns_update_norm": float(bcns_update_norm.detach().item()),
             "bcns_to_meas_grad_ratio": float(grad_ratio.detach().item()),
             "bcns_to_meas_update_ratio": float(update_ratio.detach().item()),
+            "bcns_ratio_control": self.bcns_ratio_control,
+            "bcns_target_update_ratio": self.bcns_target_update_ratio,
+            "bcns_ratio_eps": self.bcns_ratio_eps,
+            "bcns_ratio_clip_min": self.bcns_ratio_clip_min,
+            "bcns_ratio_clip_max": self.bcns_ratio_clip_max,
+            "bcns_ratio_scale": float(ratio_scale.detach().item()),
             "bcns_gamma": float(gamma),
             "bcns_tau2": float(tau2),
             "bcns_target_recomputed": bool(target_recomputed),
